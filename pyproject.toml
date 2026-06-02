@@ -1,0 +1,13 @@
+[project]
+name = "yay-agent"
+version = "0.1.0"
+dependencies = [
+    "openai",
+    "rich",
+    "typer",
+    "prompt_toolkit",
+    "requests"
+]
+
+[project.scripts]
+yay = "yay.cli:main"
