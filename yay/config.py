@@ -10,6 +10,9 @@ DEFAULT_CONFIG = {
     "provider": "openai",
     "model": None,
     "base_url": "http://localhost:1234/v1/",
+    "openai_api_key": "",
+    "openrouter_api_key": "",
+    "api_key": "",
 }
 
 

@@ -2,6 +2,7 @@ from .llm import Context, Message, Content
 from .provider import Provider
 from typing import Literal, Dict, Any, Optional
 import threading
+import json
 
 ApproveMode = Literal[
     "safe",
@@ -21,6 +22,9 @@ class Agent:
     ):
         self.provider = provider
         self.context = context
+        self.context.compression_callback = (
+            self._on_context_compressed
+        )
         self.approve_mode = approve_mode
 
         self.approval_callback = approval_callback
@@ -81,22 +85,33 @@ class Agent:
         self._approval_result = value
         self._approval_event.set()
 
-    def _extract_tool_call(self, response: Message):
+    def _extract_tool_call(self, response):
         tool = getattr(response, "tool", None)
 
         if not tool:
             return None
 
-        if isinstance(tool, dict) and "name" in tool:
+        if (
+            isinstance(tool, dict)
+            and "calls" in tool
+            and tool["calls"]
+        ):
+            call = tool["calls"][0]
+
             return {
-                "name": tool.get("name"),
-                "args": tool.get("arguments", {}) or {}
+                "id": call.get("id"),
+                "name": call.get("name"),
+                "args": call.get("arguments", {}),
             }
 
-        if isinstance(tool, dict) and "tool" in tool:
+        if (
+            isinstance(tool, dict)
+            and "name" in tool
+        ):
             return {
-                "name": tool.get("tool"),
-                "args": tool.get("args", {}) or {}
+                "id": None,
+                "name": tool.get("name"),
+                "args": tool.get("arguments", {}),
             }
 
         return None
@@ -112,15 +127,19 @@ class Agent:
             )
         )
 
+        self._compress_context_if_needed()
+
         while True:
 
             self.emit("model_processing")
 
-            response: Message = self.provider.process(
-                self.context
+            response = self.provider.process_stream(
+                self.context,
+                on_chunk=lambda data: self.emit("stream_chunk", data)
             )
 
             self.context.append(response)
+            self._compress_context_if_needed()
 
             self.emit(
                 "provider_response",
@@ -132,7 +151,7 @@ class Agent:
             )
 
             if tool_call is None:
-                
+
                 text = ""
 
                 if (
@@ -143,24 +162,25 @@ class Agent:
                         response.content,
                         "text",
                         "",
+                    ).strip()
+
+                if not text:
+                    raise RuntimeError(
+                        "Model returned empty response"
                     )
 
                 self.emit(
-                    "provider_response",
-                    {"message": response},
+                    "task_finished",
+                    {
+                        "result": text
+                    }
                 )
 
-                self.context.append(
-                    Message(
-                        role="assistant",
-                        content=Content(text=text),
-                    )
-                )
+                return text
 
-                continue
-
-            tool_name = tool_call["name"]
-            args = tool_call["args"]
+            tool_name = tool_call.get("name")
+            args = tool_call.get("args", {})
+            tool_call_id = tool_call.get("id")
 
             self.emit(
                 "tool_call",
@@ -184,15 +204,25 @@ class Agent:
                         {"tool": tool_name},
                     )
 
+                    result = "Tool execution denied by user"
+
                     self.context.append(
                         Message(
                             role="tool",
                             tool=tool_name,
+                            tool_call_id=tool_call_id,
                             content=Content(
-                                text="Rejected by user"
+                                text=json.dumps(
+                                    result,
+                                    ensure_ascii=False,
+                                )
+                                if not isinstance(result, str)
+                                else result
                             ),
                         )
                     )
+
+                    self._compress_context_if_needed()
 
                     continue
 
@@ -237,11 +267,18 @@ class Agent:
                 Message(
                     role="tool",
                     tool=tool_name,
+                    tool_call_id=tool_call_id,
                     content=Content(
-                        text=str(result)
+                        text=json.dumps(
+                            result,
+                            ensure_ascii=False,
+                        )
+                        if not isinstance(result, str)
+                        else result
                     ),
                 )
             )
+            self._compress_context_if_needed()
 
             if tool_name == "FinishTaskTool":
 
@@ -251,3 +288,23 @@ class Agent:
                 )
 
                 return result
+
+    def _compress_context_if_needed(self):
+        try:
+            self.context.compress_if_needed()
+        except Exception as e:
+            self.emit(
+                "context_compression_error",
+                {
+                    "error": str(e),
+                },
+            )
+            
+    def _on_context_compressed(
+        self,
+        info: Dict[str, Any],
+    ):
+        self.emit(
+            "context_compressed",
+            info,
+        )

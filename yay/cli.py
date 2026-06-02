@@ -14,8 +14,7 @@ from .llm import Context, Message, Content
 from .providers.openai_compatible import OpenAICompatibleProvider
 
 from .tools import (
-    CommandTool,
-    CommandBackgroundTool,
+    CMDTool,
     FinishTaskTool,
     CreateFileTool,
     RemoveFileTool,
@@ -23,9 +22,13 @@ from .tools import (
     PatchFileTool,
     ListFilesTool,
     ReadFileTool,
+    PDFTool,
     GetFileInfoTool,
     GrepTool,
     GlobTool,
+    ThinkTool,
+    CreateDirectoryTool,
+    TreeTool
 )
 
 from .config import (
@@ -34,6 +37,7 @@ from .config import (
 )
 
 from .workspace import load_workspace, save_workspace
+from .tools_renderer import render_tool_result, render_tool_call
 
 import difflib
 
@@ -43,6 +47,7 @@ console = Console()
 class AgentTUI:
     def __init__(self, agent: Agent):
         self.agent = agent
+        self.streaming_enabled = True
         self.refresh_completer()
 
     def refresh_completer(self):
@@ -111,71 +116,43 @@ class AgentTUI:
                 "[yellow]Thinking...[/yellow]"
             )
 
-        elif event == "provider_response":
+        elif event == "stream_chunk":
+            if data["type"] == "text":
+                print(data["content"], end="", flush=True)
 
+        elif event == "provider_response":
             msg = data["message"]
 
-            if (
-                hasattr(msg, "content")
-                and hasattr(msg.content, "text")
-                and msg.content.text
-            ):
-                console.print(
-                    Panel(
-                        msg.content.text,
-                        title="Assistant",
-                        border_style="green",
+            if hasattr(msg, "content") and hasattr(msg.content, "text") and msg.content.text:
+                if not getattr(self, "streaming_enabled", False):
+                    console.print(
+                        Panel(
+                            msg.content.text,
+                            title="Assistant",
+                            border_style="green",
+                        )
                     )
-                )
 
         elif event == "tool_call":
+            tool_name = data.get("tool")
+            args = data.get("args", {})
 
-            console.print(
-                f"[cyan]Tool[/cyan]: {data['tool']}"
-            )
-
-            if (
-                data["tool"] == "patch_file"
-                and isinstance(data.get("args"), dict)
-            ):
-
-                old_text = data["args"].get("old", "")
-                new_text = data["args"].get("new", "")
-
-                if old_text and new_text:
-
-                    diff = "\n".join(
-                        difflib.unified_diff(
-                            old_text.splitlines(),
-                            new_text.splitlines(),
-                            lineterm="",
-                        )
-                    )
-
-                    console.print(
-                        Syntax(
-                            diff,
-                            "diff",
-                            line_numbers=False,
-                            word_wrap=True,
-                        )
-                    )
-
+            if not tool_name or tool_name == "FinishTaskTool":
                 return
 
-            if data.get("args"):
-                console.print(data["args"])
+            print()
+            render_tool_call(tool_name, args)
 
         elif event == "tool_started":
-
-            console.print(
-                f"[yellow]Running[/yellow] {data['tool']}"
-            )
+            pass
 
         elif event == "tool_finished":
+            tool = data["tool"]
+            result = data.get("result")
 
-            console.print(
-                f"[green]Finished[/green] {data['tool']}"
+            render_tool_result(
+                tool,
+                result,
             )
 
         elif event == "tool_error":
@@ -185,24 +162,46 @@ class AgentTUI:
             )
 
         elif event == "approval_requested":
-
             answer = prompt(
-                f"\nAllow tool {data['tool']}? [y/N]: "
-            )
+                f"\nAllow tool {data['tool']}? [y/N/a]: "
+            ).strip().lower()
 
-            self.agent.resolve_approval(
-                answer.lower() in {"y", "yes"}
-            )
+            if answer == "a":
+                self.agent.approve_mode = "always"
+                self.agent.resolve_approval(True)
+            elif answer in {"y", "yes"}:
+                self.agent.resolve_approval(True)
+            else:
+                self.agent.resolve_approval(False)
 
-        elif event == "task_finished":
+        elif event == "context_compressed":
+
+            before = data.get("before_tokens")
+            after = data.get("after_tokens")
 
             console.print(
                 Panel(
-                    str(data["result"]),
-                    title="Done",
-                    border_style="green",
+                    (
+                        f"Before: {before} tokens\n"
+                        f"After:  {after} tokens"
+                    ),
+                    title="Context Compressed",
+                    border_style="yellow",
                 )
             )
+
+        elif event == "context_compression_error":
+            console.print(
+                Panel(
+                    data["error"],
+                    title="Compression Error",
+                    border_style="red",
+                )
+            )
+
+        elif event == "task_finished":
+            if getattr(self, "streaming_enabled", False):
+                print() 
 
             save_workspace(self.agent)
 
@@ -409,7 +408,11 @@ class AgentTUI:
 
     def reset_context(self):
 
-        self.agent.context = Context()
+        self.agent.context = Context(provider=self.agent.provider)
+
+        self.agent.context.compression_callback = (
+            self.agent._on_context_compressed
+        )
 
         save_workspace(self.agent)
 
@@ -475,48 +478,79 @@ class AgentTUI:
         )
 
     def switch_provider(self, provider_name):
+        tools = list(self.agent.tools.values())
 
-        tools = list(
-            self.agent.tools.values()
-        )
+        current_model = self.agent.provider.model
 
-        current_model = (
-            self.agent.provider.model
-        )
+        cfg = load_config()
 
         if provider_name == "openai":
+            api_key = (
+                cfg.get("openai_api_key")
+                or os.getenv("OPENAI_API_KEY")
+                or ""
+            )
+
+            if not api_key:
+                api_key = prompt(
+                    "OpenAI API key: ",
+                    is_password=True,
+                ).strip()
+
+                cfg["openai_api_key"] = api_key
+                save_config(cfg)
 
             provider = OpenAICompatibleProvider(
-                api_key=os.getenv(
-                    "OPENAI_API_KEY",
-                    ""
-                ),
+                api_key=api_key,
                 model=current_model,
+                base_url="https://api.openai.com/v1",
                 tools=tools,
             )
 
         elif provider_name == "openrouter":
 
+            api_key = (
+                cfg.get("openrouter_api_key")
+                or os.getenv("OPENROUTER_API_KEY")
+                or ""
+            )
+
+            if not api_key:
+                api_key = prompt(
+                    "OpenRouter API key: ",
+                    is_password=True,
+                ).strip()
+
+                cfg["openrouter_api_key"] = api_key
+                save_config(cfg)
+
             provider = OpenAICompatibleProvider(
-                api_key=os.getenv(
-                    "OPENROUTER_API_KEY",
-                    ""
-                ),
+                api_key=api_key,
                 model=current_model,
                 base_url="https://openrouter.ai/api/v1",
                 tools=tools,
             )
 
         else:
+            api_key = (
+                cfg.get("api_key")
+                or os.getenv("API_KEY")
+                or ""
+            )
 
+            if not api_key:
+                api_key = prompt(
+                    "API key: ",
+                    is_password=True,
+                ).strip()
+
+                cfg["api_key"] = api_key
+                save_config(cfg)
             provider = OpenAICompatibleProvider(
-                api_key=os.getenv(
-                    "API_KEY",
-                    "dummy",
-                ),
+                api_key=api_key,
                 model=current_model,
-                base_url=os.getenv(
-                    "OPENAI_BASE_URL",
+                base_url=cfg.get(
+                    "base_url",
                     "http://localhost:1234/v1/"
                 ),
                 tools=tools,
@@ -524,12 +558,9 @@ class AgentTUI:
 
         self.agent.provider = provider
 
-        cfg = load_config()
-
         cfg["provider"] = provider_name
 
         save_config(cfg)
-
         save_workspace(self.agent)
 
         self.refresh_completer()
@@ -537,7 +568,6 @@ class AgentTUI:
         console.print(
             f"[green]Provider:[/green] {provider_name}"
         )
-
     def set_approval_mode(self, mode):
 
         self.agent.approve_mode = mode
@@ -629,10 +659,24 @@ class AgentTUI:
                 cwd = os.getcwd()
                 folder = os.path.basename(cwd)
                 
+                usage = self.agent.context.usage_percent()
+
+                tokens = self.agent.context.estimate_tokens()
+                max_tokens = self.agent.context.max_tokens
+                usage = self.agent.context.usage_percent()
+
+                if usage < 50:
+                    color = "ansigreen"
+                elif usage < 80:
+                    color = "ansiyellow"
+                else:
+                    color = "ansired"
+
                 text = prompt(
                     HTML(
                         f"<ansiblue>{model_name}</ansiblue> "
                         f"<ansigreen>{folder}</ansigreen> "
+                        f"<{color}>[{tokens}/{max_tokens} | {usage:.0f}%]</{color}> "
                         "<ansicyan>❯ </ansicyan>"
                     ),
                     completer=self.completer,
@@ -766,11 +810,27 @@ class AgentTUI:
                     f"[red]{e}[/red]"
                 )
 
+def get_provider_api_key(cfg, provider_name):
+    if provider_name == "openai":
+        return (
+            cfg.get("openai_api_key")
+            or os.getenv("OPENAI_API_KEY", "")
+        )
+
+    if provider_name == "openrouter":
+        return (
+            cfg.get("openrouter_api_key")
+            or os.getenv("OPENROUTER_API_KEY", "")
+        )
+
+    return (
+        cfg.get("api_key")
+        or os.getenv("API_KEY", "dummy")
+    )
 
 def build_agent():
     tools = [
-        CommandTool(),
-        CommandBackgroundTool(),
+        CMDTool(),
         FinishTaskTool(),
         CreateFileTool(),
         RemoveFileTool(),
@@ -778,9 +838,12 @@ def build_agent():
         PatchFileTool(),
         ListFilesTool(),
         ReadFileTool(),
+        PDFTool(),
         GetFileInfoTool(),
         GrepTool(),
         GlobTool(),
+        ThinkTool(),
+        CreateDirectoryTool(),
     ]
 
     cfg = load_config()
@@ -792,21 +855,23 @@ def build_agent():
 
     if provider_name == "openrouter":
         provider = OpenAICompatibleProvider(
-            api_key=os.getenv(
-                "OPENROUTER_API_KEY",
-                ""
-            ),
+            api_key=get_provider_api_key(cfg, "openrouter"),
             model=cfg["model"] or "",
             base_url="https://openrouter.ai/api/v1",
             tools=tools,
         )
 
+    elif provider_name == "openai":
+        provider = OpenAICompatibleProvider(
+            api_key=get_provider_api_key(cfg, "openai"),
+            model=cfg["model"] or "",
+            base_url="https://api.openai.com/v1",
+            tools=tools,
+        )
+
     else:
         provider = OpenAICompatibleProvider(
-            api_key=os.getenv(
-                "OPENAI_API_KEY",
-                "dummy",
-            ),
+            api_key=get_provider_api_key(cfg, provider_name),
             model=cfg["model"] or "",
             base_url=cfg["base_url"],
             tools=tools,
@@ -857,7 +922,7 @@ def build_agent():
 
     agent = Agent(
         provider=provider,
-        context=Context(),
+        context=Context(provider=provider),
         tools=tools,
         approve_mode="safe",
     )

@@ -15,9 +15,10 @@ def workspace_path():
     return Path.cwd() / WORKSPACE_FILE
 
 
-def save_workspace(agent): 
+def save_workspace(agent):
+
     data = {
-        "version": 1,
+        "version": 2,
         "provider": agent.provider.__class__.__name__,
         "model": getattr(
             agent.provider,
@@ -38,11 +39,21 @@ def save_workspace(agent):
         data["messages"].append(
             {
                 "role": msg.role,
-                "content": msg.content.text,
-                "tool": (
-                    msg.tool.__class__.__name__
-                    if msg.tool
-                    else None
+                "content": (
+                    msg.content.text
+                    if msg.content
+                    else ""
+                ),
+                "tool": msg.tool,
+                "tool_call_id": getattr(
+                    msg,
+                    "tool_call_id",
+                    None,
+                ),
+                "tool_calls": getattr(
+                    msg,
+                    "tool_calls",
+                    [],
                 ),
                 "time": msg.time.isoformat(),
             }
@@ -94,7 +105,7 @@ def load_workspace(agent):
             "safe",
         )
 
-        context = Context()
+        context = Context(provider=agent.provider)
 
         for item in data.get(
             "messages",
@@ -102,26 +113,38 @@ def load_workspace(agent):
         ):
 
             msg = Message(
+                role=item.get(
+                    "role",
+                    "user",
+                ),
                 content=Content(
                     item.get(
                         "content",
                         "",
                     )
                 ),
-                role=item.get(
-                    "role",
-                    "user",
+                tool=item.get(
+                    "tool"
+                ),
+                tool_call_id=item.get(
+                    "tool_call_id"
+                ),
+                tool_calls=item.get(
+                    "tool_calls",
+                    [],
                 ),
             )
 
             if item.get("time"):
 
                 try:
+
                     msg.time = (
                         datetime.fromisoformat(
                             item["time"]
                         )
                     )
+
                 except Exception:
                     pass
 
@@ -131,11 +154,17 @@ def load_workspace(agent):
 
         return True
 
-    except Exception:
+    except Exception as e:
+
+        print(
+            f"Workspace load error: {e}"
+        )
+
         return False
 
 
 def clear_workspace():
+
     path = workspace_path()
 
     if path.exists():
@@ -143,4 +172,5 @@ def clear_workspace():
 
 
 def workspace_exists():
+
     return workspace_path().exists()

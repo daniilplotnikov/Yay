@@ -2,6 +2,8 @@ from ..tool import Tool
 import os
 import time
 from pathlib import Path
+from pypdf import PdfReader
+import difflib
 
 class CreateFileTool(Tool):
     def __init__(self):
@@ -23,36 +25,242 @@ class CreateFileTool(Tool):
         path = args["path"]
         content = args["content"]
 
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        os.makedirs(
+            os.path.dirname(path) or ".",
+            exist_ok=True,
+        )
+
+        existed = os.path.exists(path)
+
+        old_content = ""
+
+        if existed:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    old_content = f.read()
+            except Exception:
+                pass
 
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        return f"File created: {path}"
+        diff = "\n".join(
+            difflib.unified_diff(
+                old_content.splitlines(),
+                content.splitlines(),
+                fromfile=f"{path} (old)",
+                tofile=f"{path} (new)",
+                lineterm="",
+            )
+        )
 
-class RemoveFileTool(Tool):
+        return {
+            "action": (
+                "updated"
+                if existed
+                else "created"
+            ),
+            "path": path,
+            "diff": diff,
+        }
+
+class CreateDirectoryTool(Tool):
+
     def __init__(self):
         super().__init__()
-        self.description = "Delete a file"
+
+        self.description = "Create directory"
 
         self.arguments = {
             "type": "object",
             "properties": {
-                "path": {"type": "string"}
+                "path": {
+                    "type": "string"
+                }
             },
             "required": ["path"]
+        }
+
+    def execute(self, args):
+
+        path = args["path"]
+
+        os.makedirs(path, exist_ok=True)
+
+        return {
+            "action": "created_directory",
+            "path": path,
+        }
+    
+class RemoveFileTool(Tool):
+    def __init__(self):
+        super().__init__()
+
+        self.description = "Delete one or more files"
+
+        self.arguments = {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            },
+            "required": ["paths"]
         }
 
         self.is_safe = False
 
     def execute(self, args):
-        path = args["path"]
+        results = []
 
-        if os.path.exists(path):
-            os.remove(path)
-            return f"Deleted: {path}"
+        for path in args["paths"]:
 
-        return f"File not found: {path}"
+            if not os.path.exists(path):
+                results.append({
+                    "path": path,
+                    "error": "File not found",
+                })
+                continue
+
+            content = ""
+
+            try:
+                with open(
+                    path,
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+                    content = f.read()
+            except Exception:
+                pass
+
+            try:
+                os.remove(path)
+
+                diff = "\n".join(
+                    difflib.unified_diff(
+                        content.splitlines(),
+                        [],
+                        fromfile=path,
+                        tofile="/dev/null",
+                        lineterm="",
+                    )
+                )
+
+                results.append({
+                    "path": path,
+                    "status": "deleted",
+                    "diff": diff,
+                })
+
+            except Exception as e:
+                results.append({
+                    "path": path,
+                    "error": str(e),
+                })
+
+        return {
+            "deleted": sum(
+                1
+                for r in results
+                if r.get("status") == "deleted"
+            ),
+            "results": results,
+        }
+
+class TreeTool(Tool):
+    def __init__(self):
+        super().__init__()
+
+        self.description = (
+            "Show directory tree"
+        )
+
+        self.arguments = {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "default": "."
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "default": 4
+                }
+            }
+        }
+
+    def execute(self, args):
+
+        root = Path(
+            args.get("path", ".")
+        )
+
+        max_depth = args.get(
+            "max_depth",
+            4,
+        )
+
+        lines = []
+
+        def walk(
+            current: Path,
+            prefix: str = "",
+            depth: int = 0,
+        ):
+            if depth > max_depth:
+                return
+
+            try:
+                entries = sorted(
+                    current.iterdir(),
+                    key=lambda p: (
+                        not p.is_dir(),
+                        p.name.lower(),
+                    ),
+                )
+            except Exception:
+                return
+
+            for i, entry in enumerate(entries):
+
+                last = (
+                    i == len(entries) - 1
+                )
+
+                connector = (
+                    "└── "
+                    if last
+                    else "├── "
+                )
+
+                lines.append(
+                    prefix
+                    + connector
+                    + entry.name
+                )
+
+                if entry.is_dir():
+
+                    walk(
+                        entry,
+                        prefix
+                        + (
+                            "    "
+                            if last
+                            else "│   "
+                        ),
+                        depth + 1,
+                    )
+
+        lines.append(root.name)
+
+        walk(root)
+
+        return "\n".join(lines)
 
 class ListFilesTool(Tool):
     def __init__(self):
@@ -207,10 +415,21 @@ class PatchFileTool(Tool):
             encoding="utf-8"
         )
 
+        diff = "\n".join(
+            difflib.unified_diff(
+                original.splitlines(),
+                content.splitlines(),
+                fromfile=str(path),
+                tofile=str(path),
+                lineterm="",
+            )
+        )
+
         return {
             "status": "patched",
             "path": str(path),
             "results": results,
+            "diff": diff,
         }
 
 class ReadFileTool(Tool):
@@ -405,3 +624,80 @@ class GlobTool(Tool):
             "count": len(files),
             "files": files[:1000],
         }
+
+class PDFTool(Tool):
+    def __init__(self):
+        super().__init__()
+
+        self.description = "Read text from PDF file"
+
+        self.arguments = {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string"
+                },
+                "pages": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                }
+            },
+            "required": ["path"]
+        }
+
+    def execute(self, args):
+
+        if PdfReader is None:
+            return {
+                "error": (
+                    "pypdf is not installed. "
+                    "Run: pip install pypdf"
+                )
+            }
+
+        path = Path(args["path"])
+
+        if not path.exists():
+            return {
+                "error": "File not found",
+                "path": str(path)
+            }
+
+        try:
+
+            reader = PdfReader(str(path))
+
+            page_filter = args.get("pages")
+
+            pages = []
+            text_parts = []
+
+            for idx, page in enumerate(reader.pages):
+
+                page_num = idx + 1
+
+                if (
+                    page_filter is not None
+                    and page_num not in page_filter
+                ):
+                    continue
+
+                text = page.extract_text() or ""
+
+                pages.append(page_num)
+                text_parts.append(text)
+
+            return {
+                "path": str(path),
+                "pages": pages,
+                "page_count": len(reader.pages),
+                "text": "\n\n".join(text_parts)
+            }
+
+        except Exception as e:
+            return {
+                "error": str(e),
+                "path": str(path)
+            }

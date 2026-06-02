@@ -6,7 +6,8 @@ dependencies = [
     "rich",
     "typer",
     "prompt_toolkit",
-    "requests"
+    "requests",
+    "pypdf"
 ]
 
 [project.scripts]
