@@ -14,7 +14,7 @@ class CommandTool(Tool):
             "required": ["cmd"]
         }
 
-        is_safe = False
+        self.is_safe = False
 
     def execute(self, args):
         cmd = args["cmd"]

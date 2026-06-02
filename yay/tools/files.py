@@ -1,6 +1,7 @@
 from ..tool import Tool
 import os
 import time
+from pathlib import Path
 
 class CreateFileTool(Tool):
     def __init__(self):
@@ -112,6 +113,7 @@ class SearchTool(Tool):
 class PatchFileTool(Tool):
     def __init__(self):
         super().__init__()
+
         self.description = "Apply search/replace patches to file"
 
         self.is_safe = False
@@ -119,36 +121,97 @@ class PatchFileTool(Tool):
         self.arguments = {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {
+                    "type": "string"
+                },
                 "changes": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "find": {"type": "string"},
-                            "replace": {"type": "string"}
+                            "find": {
+                                "type": "string"
+                            },
+                            "replace": {
+                                "type": "string"
+                            }
                         },
-                        "required": ["find", "replace"]
+                        "required": [
+                            "find",
+                            "replace"
+                        ]
                     }
                 }
             },
-            "required": ["path", "changes"]
+            "required": [
+                "path",
+                "changes"
+            ]
         }
 
     def execute(self, args):
-        path = args["path"]
-        changes = args["changes"]
 
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
+        path = Path(args["path"])
 
-        for c in changes:
-            content = content.replace(c["find"], c["replace"])
+        if not path.exists():
+            return {
+                "error": f"File not found: {path}"
+            }
 
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        content = path.read_text(
+            encoding="utf-8"
+        )
 
-        return f"Patched file: {path}"
+        original = content
+
+        results = []
+
+        for idx, change in enumerate(
+            args["changes"],
+            start=1,
+        ):
+
+            find = change["find"]
+            replace = change["replace"]
+
+            count = content.count(find)
+
+            if count == 0:
+
+                results.append({
+                    "change": idx,
+                    "status": "not_found"
+                })
+
+                continue
+
+            content = content.replace(
+                find,
+                replace,
+            )
+
+            results.append({
+                "change": idx,
+                "status": "ok",
+                "replacements": count,
+            })
+
+        if content == original:
+            return {
+                "status": "no_changes",
+                "results": results,
+            }
+
+        path.write_text(
+            content,
+            encoding="utf-8"
+        )
+
+        return {
+            "status": "patched",
+            "path": str(path),
+            "results": results,
+        }
 
 class ReadFileTool(Tool):
     def __init__(self):
@@ -233,3 +296,112 @@ class GetFileInfoTool(Tool):
                 "error": str(e),
                 "path": path
             }
+        
+class GrepTool(Tool):
+    def __init__(self):
+        super().__init__()
+
+        self.description = "Search text inside files"
+
+        self.arguments = {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string",
+                    "default": "."
+                }
+            },
+            "required": ["pattern"]
+        }
+
+    def execute(self, args):
+
+        pattern = args["pattern"]
+        root = Path(
+            args.get("path", ".")
+        )
+
+        results = []
+
+        for file in root.rglob("*"):
+
+            if not file.is_file():
+                continue
+
+            try:
+
+                text = file.read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+
+            except Exception:
+                continue
+
+            for lineno, line in enumerate(
+                text.splitlines(),
+                start=1,
+            ):
+
+                if pattern in line:
+
+                    results.append({
+                        "file": str(file),
+                        "line": lineno,
+                        "text": line.strip(),
+                    })
+
+        return {
+            "pattern": pattern,
+            "matches": len(results),
+            "results": results[:500],
+        }
+    
+class GlobTool(Tool):
+    def __init__(self):
+        super().__init__()
+
+        self.description = (
+            "Find files by glob pattern"
+        )
+
+        self.arguments = {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string",
+                    "default": "."
+                }
+            },
+            "required": ["pattern"]
+        }
+
+    def execute(self, args):
+
+        pattern = args["pattern"]
+
+        root = Path(
+            args.get("path", ".")
+        )
+
+        files = []
+
+        for file in root.rglob(pattern):
+
+            if file.is_file():
+
+                files.append(
+                    str(file)
+                )
+
+        return {
+            "pattern": pattern,
+            "count": len(files),
+            "files": files[:1000],
+        }

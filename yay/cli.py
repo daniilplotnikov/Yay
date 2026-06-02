@@ -10,7 +10,7 @@ from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
 
 from .agent import Agent
-from .llm import Context
+from .llm import Context, Message, Content
 from .providers.openai_compatible import OpenAICompatibleProvider
 
 from .tools import (
@@ -24,12 +24,16 @@ from .tools import (
     ListFilesTool,
     ReadFileTool,
     GetFileInfoTool,
+    GrepTool,
+    GlobTool,
 )
 
 from .config import (
     load_config,
     save_config,
 )
+
+from .workspace import load_workspace, save_workspace
 
 import difflib
 
@@ -200,6 +204,8 @@ class AgentTUI:
                 )
             )
 
+            save_workspace(self.agent)
+
     def show_help(self):
 
         console.print(
@@ -321,6 +327,8 @@ class AgentTUI:
 
         save_config(cfg)
 
+        save_workspace(self.agent)
+
         self.refresh_completer()
 
         console.print(
@@ -403,6 +411,8 @@ class AgentTUI:
 
         self.agent.context = Context()
 
+        save_workspace(self.agent)
+
         console.print(
             "[green]Context cleared[/green]"
         )
@@ -441,7 +451,6 @@ class AgentTUI:
             )
         )
 
-
     def set_base_url(self, url):
 
         provider = self.agent.provider
@@ -455,6 +464,11 @@ class AgentTUI:
             provider.base_url = url
 
         self.refresh_completer()
+        cfg = load_config()
+        cfg["base_url"] = url
+
+        save_config(cfg)
+        save_workspace(self.agent)
 
         console.print(
             f"[green]Base URL:[/green] {url}"
@@ -516,6 +530,8 @@ class AgentTUI:
 
         save_config(cfg)
 
+        save_workspace(self.agent)
+
         self.refresh_completer()
 
         console.print(
@@ -525,6 +541,8 @@ class AgentTUI:
     def set_approval_mode(self, mode):
 
         self.agent.approve_mode = mode
+
+        save_workspace(self.agent)
 
         console.print(
             f"[green]Approval mode:[/green] {mode}"
@@ -710,7 +728,6 @@ class AgentTUI:
                     mode = text.split(
                         maxsplit=1
                     )[1].strip()
-
                     if mode not in {
                         "auto",
                         "safe",
@@ -723,43 +740,34 @@ class AgentTUI:
                         )
 
                         continue
-
                     self.set_approval_mode(mode)
 
                 elif text in {
                     "/clear",
                     "/cls",
                 }:
-
                     self.clear_screen()
-
                 else:
-
                     self.agent.work_loop(text)
 
             except KeyboardInterrupt:
-
                 console.print(
                     "\n[yellow]Interrupted[/yellow]"
                 )
 
             except EOFError:
-
                 console.print(
                     "\n[blue]Bye![/blue]"
                 )
-
                 break
 
             except Exception as e:
-
                 console.print(
                     f"[red]{e}[/red]"
                 )
 
 
 def build_agent():
-
     tools = [
         CommandTool(),
         CommandBackgroundTool(),
@@ -771,6 +779,8 @@ def build_agent():
         ListFilesTool(),
         ReadFileTool(),
         GetFileInfoTool(),
+        GrepTool(),
+        GlobTool(),
     ]
 
     cfg = load_config()
@@ -845,18 +855,22 @@ def build_agent():
     except Exception:
         pass
 
-    return Agent(
+    agent = Agent(
         provider=provider,
         context=Context(),
         tools=tools,
         approve_mode="safe",
     )
 
+    load_workspace(agent)
+
+    return agent
+
 
 def main():
 
     agent = build_agent()
-
+        
     tui = AgentTUI(agent)
 
     agent.event_callback = tui.event_handler

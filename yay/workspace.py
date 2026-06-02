@@ -1,0 +1,146 @@
+import json
+from pathlib import Path
+from datetime import datetime
+
+from .llm import (
+    Context,
+    Message,
+    Content,
+)
+
+WORKSPACE_FILE = ".yay_workspace.json"
+
+
+def workspace_path():
+    return Path.cwd() / WORKSPACE_FILE
+
+
+def save_workspace(agent): 
+    data = {
+        "version": 1,
+        "provider": agent.provider.__class__.__name__,
+        "model": getattr(
+            agent.provider,
+            "model",
+            "",
+        ),
+        "base_url": getattr(
+            agent.provider,
+            "base_url",
+            "",
+        ),
+        "approve_mode": agent.approve_mode,
+        "messages": [],
+    }
+
+    for msg in agent.context.messages:
+
+        data["messages"].append(
+            {
+                "role": msg.role,
+                "content": msg.content.text,
+                "tool": (
+                    msg.tool.__class__.__name__
+                    if msg.tool
+                    else None
+                ),
+                "time": msg.time.isoformat(),
+            }
+        )
+
+    workspace_path().write_text(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def load_workspace(agent):
+
+    path = workspace_path()
+
+    if not path.exists():
+        return False
+
+    try:
+
+        data = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if data.get("model"):
+            agent.provider.model = data[
+                "model"
+            ]
+
+        if (
+            data.get("base_url")
+            and hasattr(
+                agent.provider,
+                "base_url"
+            )
+        ):
+            agent.provider.base_url = data[
+                "base_url"
+            ]
+
+        agent.approve_mode = data.get(
+            "approve_mode",
+            "safe",
+        )
+
+        context = Context()
+
+        for item in data.get(
+            "messages",
+            [],
+        ):
+
+            msg = Message(
+                content=Content(
+                    item.get(
+                        "content",
+                        "",
+                    )
+                ),
+                role=item.get(
+                    "role",
+                    "user",
+                ),
+            )
+
+            if item.get("time"):
+
+                try:
+                    msg.time = (
+                        datetime.fromisoformat(
+                            item["time"]
+                        )
+                    )
+                except Exception:
+                    pass
+
+            context.append(msg)
+
+        agent.context = context
+
+        return True
+
+    except Exception:
+        return False
+
+
+def clear_workspace():
+    path = workspace_path()
+
+    if path.exists():
+        path.unlink()
+
+
+def workspace_exists():
+    return workspace_path().exists()
