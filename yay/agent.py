@@ -132,25 +132,32 @@ class Agent:
             )
 
             if tool_call is None:
-
-                result = ""
+                
+                text = ""
 
                 if (
                     hasattr(response, "content")
                     and response.content
                 ):
-                    result = getattr(
+                    text = getattr(
                         response.content,
                         "text",
                         "",
                     )
 
                 self.emit(
-                    "task_finished",
-                    {"result": result},
+                    "provider_response",
+                    {"message": response},
                 )
 
-                return result
+                self.context.append(
+                    Message(
+                        role="assistant",
+                        content=Content(text=text),
+                    )
+                )
+
+                continue
 
             tool_name = tool_call["name"]
             args = tool_call["args"]
