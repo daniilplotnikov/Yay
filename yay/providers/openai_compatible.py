@@ -1,21 +1,35 @@
 import json
 from openai import OpenAI
-from ..llm import Model, Message, Content
+from ..llm import Message, Content
+from ..provider import Provider
 
-class OpenAICompatibleModel(Model):
+class OpenAICompatibleProvider(Provider):
     def __init__(self, api_key: str, model: str, base_url: str, tools: list = None):
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.tools = tools or []
 
     def _messages(self, context):
-        return [
-            {
-                "role": m.role,
-                "content": m.content.text
-            }
-            for m in context.messages
-        ]
+        result = []
+        for m in context.messages:
+            if m.role == "tool":
+                result.append(
+                    {
+                        "role": "tool",
+                        "content": (
+                            f"Tool: {m.tool}\n"
+                            f"Output:\n{m.content.text}"
+                        ),
+                    }
+                )
+            else:
+                result.append(
+                    {
+                        "role": m.role,
+                        "content": m.content.text,
+                    }
+                )
+        return result
 
     def _tools(self):
         return [
@@ -29,6 +43,37 @@ class OpenAICompatibleModel(Model):
             }
             for t in self.tools
         ]
+    
+    def get_models(self):
+        try:
+            models = self.client.models.list()
+
+            result = []
+
+            for model in getattr(models, "data", []):
+                model_id = getattr(model, "id", None)
+
+                if model_id:
+                    result.append(model_id)
+
+            return sorted(result)
+
+        except Exception as e:
+            return {
+                "error": str(e)
+            }
+
+    def set_model(self, model: str):
+
+        self.model = model
+
+        return model
+    
+    def set_base_url(self, base_url: str):
+
+        self.client.base_url = base_url
+
+        return base_url
 
     def process(self, context):
         resp = self.client.chat.completions.create(
@@ -51,7 +96,7 @@ class OpenAICompatibleModel(Model):
                 args = {}
 
             return Message(
-                role="agent",
+                role="assistant",
                 content=Content(text=""),
                 tool={
                     "name": name,
@@ -60,7 +105,7 @@ class OpenAICompatibleModel(Model):
             )
 
         return Message(
-            role="agent",
+            role="assistant",
             content=Content(text=msg.content or ""),
             tool=None
         )

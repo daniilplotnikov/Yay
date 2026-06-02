@@ -23,13 +23,3 @@ class Context():
 
     def append(self, message: Message):
         self.messages.append(message)
-
-class Model():
-    def __init__(self):
-        pass
-
-    def process(self, context):
-
-        output = Message(content=Content(text=''), role="agent")
-
-        return output

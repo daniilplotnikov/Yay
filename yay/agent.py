@@ -1,21 +1,25 @@
-from .llm import Model, Context, Message, Content
+from .llm import Context, Message, Content
+from .provider import Provider
 from typing import Literal, Dict, Any, Optional
 import threading
 
-ApproveMode = Literal["auto", "safe"]
-
+ApproveMode = Literal[
+    "safe",
+    "always",
+    "never",
+]
 
 class Agent:
     def __init__(
         self,
-        model: Model,
+        provider: Provider,
         context: Context,
         tools: list,
-        approve_mode: ApproveMode = "auto",
+        approve_mode: ApproveMode = "always",
         approval_callback=None,
         event_callback=None,
     ):
-        self.model = model
+        self.provider = provider
         self.context = context
         self.approve_mode = approve_mode
 
@@ -39,10 +43,22 @@ class Agent:
         return tool.run(args)
 
     def needs_approval(self, tool_name: str) -> bool:
+
         tool = self.tools.get(tool_name)
+
         if not tool:
             return False
-        return (not tool.is_safe) and self.approve_mode == "safe"
+
+        if self.approve_mode == "always":
+            return False
+
+        if self.approve_mode == "never":
+            return True
+
+        if self.approve_mode == "safe":
+            return not tool.is_safe
+
+        return False
 
     def request_approval(self, tool_name, args):
         self._approval_event.clear()
@@ -92,71 +108,139 @@ class Agent:
             Message(
                 role="user",
                 content=Content(text=prompt),
-                tool=None
+                tool=None,
             )
         )
 
         while True:
+
             self.emit("model_processing")
 
-            response: Message = self.model.process(self.context)
+            response: Message = self.provider.process(
+                self.context
+            )
+
             self.context.append(response)
 
-            self.emit("model_response", {"message": response})
+            self.emit(
+                "provider_response",
+                {"message": response},
+            )
 
-            tool_call = self._extract_tool_call(response)
+            tool_call = self._extract_tool_call(
+                response
+            )
+
+            if tool_call is None:
+
+                result = ""
+
+                if (
+                    hasattr(response, "content")
+                    and response.content
+                ):
+                    result = getattr(
+                        response.content,
+                        "text",
+                        "",
+                    )
+
+                self.emit(
+                    "task_finished",
+                    {"result": result},
+                )
+
+                return result
 
             tool_name = tool_call["name"]
             args = tool_call["args"]
 
-            self.emit("tool_call", {
-                "tool": tool_name,
-                "args": args
-            })
+            self.emit(
+                "tool_call",
+                {
+                    "tool": tool_name,
+                    "args": args,
+                },
+            )
 
             if self.needs_approval(tool_name):
-                approved = self.request_approval(tool_name, args)
+
+                approved = self.request_approval(
+                    tool_name,
+                    args,
+                )
 
                 if not approved:
-                    self.emit("approval_denied", {"tool": tool_name})
+
+                    self.emit(
+                        "approval_denied",
+                        {"tool": tool_name},
+                    )
 
                     self.context.append(
                         Message(
                             role="tool",
                             tool=tool_name,
-                            content=Content(text="Rejected by user")
+                            content=Content(
+                                text="Rejected by user"
+                            ),
                         )
                     )
+
                     continue
 
-                self.emit("approval_granted", {"tool": tool_name})
+                self.emit(
+                    "approval_granted",
+                    {"tool": tool_name},
+                )
 
-            self.emit("tool_started", {"tool": tool_name})
+            self.emit(
+                "tool_started",
+                {"tool": tool_name},
+            )
 
             try:
-                result = self.run_tool(tool_name, args)
 
-                self.emit("tool_finished", {
-                    "tool": tool_name,
-                    "result": result
-                })
+                result = self.run_tool(
+                    tool_name,
+                    args,
+                )
+
+                self.emit(
+                    "tool_finished",
+                    {
+                        "tool": tool_name,
+                        "result": result,
+                    },
+                )
 
             except Exception as e:
+
                 result = {"error": str(e)}
 
-                self.emit("tool_error", {
-                    "tool": tool_name,
-                    "error": str(e)
-                })
+                self.emit(
+                    "tool_error",
+                    {
+                        "tool": tool_name,
+                        "error": str(e),
+                    },
+                )
 
             self.context.append(
                 Message(
                     role="tool",
                     tool=tool_name,
-                    content=Content(text=str(result))
+                    content=Content(
+                        text=str(result)
+                    ),
                 )
             )
 
             if tool_name == "FinishTaskTool":
-                self.emit("task_finished", {"result": result})
+
+                self.emit(
+                    "task_finished",
+                    {"result": result},
+                )
+
                 return result
