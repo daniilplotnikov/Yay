@@ -2,7 +2,7 @@ import json
 from openai import OpenAI
 from ..llm import Model, Message, Content
 
-class OpenAiModel(Model):
+class OpenAIModel(Model):
     def __init__(self, api_key: str, model: str, tools: list = None):
         self.client = OpenAI(api_key=api_key)
         self.model = model

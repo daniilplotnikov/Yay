@@ -1,6 +1,6 @@
 from .llm import Model
 
-class LLMProvider:
+class Provider:
     def __init__(self, backend: Model):
         self.backend = backend
 
