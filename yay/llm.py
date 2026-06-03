@@ -55,7 +55,7 @@ class Context:
 
     @property
     def max_tokens(self):
-        return getattr(self.provider, "max_context_tokens", 0)
+        return getattr(self.provider, "context_length", 0)
 
     def usage_percent(self):
         max_tokens = self.max_tokens
@@ -67,9 +67,6 @@ class Context:
         return self.usage_percent() >= self.compress_threshold * 100
 
     def compress(self):
-        if not self.needs_compression():
-            return False
-
         old_messages = [
             m for m in self.messages
             if not (m.role == "system" and getattr(getattr(m, "content", None), "text", "").startswith(SYSTEM_SUMMARY_MARKER))

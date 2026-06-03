@@ -13,7 +13,7 @@ class OpenAICompatibleProvider(Provider):
         self.model = model
         self.tools = tools or []
 
-        self.max_context_tokens = (
+        self.context_length = (
             self._detect_context_size()
         )
 
@@ -89,7 +89,7 @@ class OpenAICompatibleProvider(Provider):
 
     def set_model(self, model):
         self.model = model
-        self.max_context_tokens = (
+        self.context_length = (
             self._detect_context_size()
         )
 
@@ -242,25 +242,28 @@ class OpenAICompatibleProvider(Provider):
     def _detect_context_size(self) -> int:
         def find_context(obj):
             if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if k.lower() in ("context_length", "max_context_length", "max_tokens", "context_window"):
-                        try:
-                            return int(v)
-                        except Exception:
-                            continue
+                for target_key in ("context_length", "max_context_length", "context_window"):
+                    for k, v in obj.items():
+                        if k.lower() == target_key:
+                            try:
+                                return int(v)
+                            except (ValueError, TypeError):
+                                continue
+                
+                if "max_tokens" in obj:
+                    try:
+                        return int(obj["max_tokens"])
+                    except (ValueError, TypeError):
+                        pass
+                        
+                for v in obj.values():
                     result = find_context(v)
                     if result:
                         return result
+                        
             elif hasattr(obj, "__dict__"):
-                for k, v in vars(obj).items():
-                    if k.lower() in ("context_length", "max_context_length", "max_tokens", "context_window"):
-                        try:
-                            return int(v)
-                        except Exception:
-                            continue
-                    result = find_context(v)
-                    if result:
-                        return result
+                return find_context(vars(obj))
+                
             elif isinstance(obj, (list, tuple, set)):
                 for item in obj:
                     result = find_context(item)
@@ -268,19 +271,25 @@ class OpenAICompatibleProvider(Provider):
                         return result
             return None
 
-        if "openrouter.ai" in str(self.client.base_url):
+        base_url_str = str(self.client.base_url).rstrip("/")
+        
+        if "openrouter.ai" in base_url_str:
             try:
                 import requests
+                clean_url = base_url_str.split("/api/v1")[0] + "/api/v1/models"
+
                 response = requests.get(
-                    f"{str(self.client.base_url)}/api/v1/models",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    clean_url,
                     timeout=10,
                 )
                 response.raise_for_status()
                 data = response.json()
-                models = data.get("data", data)
+                
+                models = data.get("data", [])
                 for model in models:
                     if model.get("id") == self.model:
+                        if "context_length" in model:
+                            return int(model["context_length"])
                         result = find_context(model)
                         if result:
                             return result
@@ -289,13 +298,17 @@ class OpenAICompatibleProvider(Provider):
 
         try:
             models = self.client.models.list()
-            for model in getattr(models, "data", []):
-                if getattr(model, "id", None) != self.model:
+            model_list = getattr(models, "data", models if isinstance(models, list) else [])
+            
+            for model in model_list:
+                model_id = getattr(model, "id", None) or (model.get("id") if isinstance(model, dict) else None)
+                if model_id != self.model:
                     continue
+                    
                 result = find_context(model)
                 if result:
                     return result
         except Exception:
             pass
 
-        return 32000
+        return 128000
