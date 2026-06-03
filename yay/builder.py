@@ -19,7 +19,9 @@ from .tools import (
     GlobTool,
     ThinkTool,
     CreateDirectoryTool,
-    TreeTool
+    TreeTool,
+    WebSearchTool,
+    WebVisitTool
 )
 
 from rich.console import Console
@@ -63,6 +65,8 @@ def build_agent():
         ThinkTool(),
         CreateDirectoryTool(),
         TreeTool(),
+        WebSearchTool(),
+        WebVisitTool()
     ]
 
     cfg = load_config()
