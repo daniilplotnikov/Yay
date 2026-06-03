@@ -1,13 +1,19 @@
 import os
 
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.completion import FuzzyWordCompleter
+from prompt_toolkit.application import Application
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.widgets import TextArea
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.document import Document
 
 from .agent import Agent
 from .llm import Context
@@ -31,6 +37,60 @@ class AgentTUI:
         self.streaming_enabled = True
         self._streaming_active = False
         self.refresh_completer()
+
+        self.status_bar = Window(
+            height=1,
+            content=FormattedTextControl(self.get_status_text)
+        )
+
+        self.output = self.output = TextArea(
+            scrollbar=True,
+            focusable=True,  
+            wrap_lines=True,
+            height=Dimension(weight=1)
+        )
+        self.input = TextArea(height=1, prompt="❯ ", multiline=False, completer=self.completer,)
+        self.header = Window(height=1, content=FormattedTextControl("Yet Another Yielder"))
+        root = HSplit([
+            self.output,
+            self.status_bar,
+            self.input,
+        ])
+        self.layout = Layout(container=root, focused_element=self.input)
+        
+        kb = KeyBindings()
+
+        @kb.add("enter")
+        def _(event):
+            text = self.input.text.strip()
+            if not text:
+                return
+            self.input.buffer.document = Document("")
+            self.handle_command(text)
+
+        @kb.add("pageup")
+        def _(event):
+            event.app.layout.focus(self.output)
+            self.output.buffer.cursor_up(count=10)
+
+        @kb.add("pagedown")
+        def _(event):
+            event.app.layout.focus(self.output)
+            self.output.buffer.cursor_down(count=10)
+
+        self.application = Application(
+            layout=self.layout,
+            key_bindings=kb,
+            full_screen=True,
+        )
+
+        self.messages = []
+
+    def append_output(self, text):
+        self.messages.append(str(text))
+        self.output.text = "\n".join(self.messages[-100:])
+        self.output.buffer.cursor_position = len(self.output.text)
+        self.application.invalidate()
 
     def refresh_completer(self):
 
@@ -71,16 +131,13 @@ class AgentTUI:
         ]
 
         try:
-
             models = self.agent.provider.get_models()
 
             if isinstance(models, list):
-
                 commands.extend(
                     f"/model {m}"
                     for m in models
                 )
-
         except Exception:
             pass
 
@@ -90,40 +147,44 @@ class AgentTUI:
             sentence=True,
         )
 
+        if hasattr(self, "input"):
+            self.input.buffer.completer = self.completer
+
     def event_handler(self, event, data):
 
         if event == "task_started":
 
-            console.print(
-                Panel(
-                    data["prompt"],
-                    title="Task",
-                    border_style="blue",
-                )
+            self.append_output(
+                f"\n[Task]\n{data['prompt']}\n"
             )
 
         elif event == "model_processing":
 
-            console.print(
-                "[yellow]Thinking...[/yellow]"
-            )
+            self.append_output("")
+            self.append_output("Thinking...")
+            self.append_output("")
 
         elif event == "stream_chunk":
+
             if data["type"] == "text":
                 self._streaming_active = True
-                print(data["content"], end="", flush=True)
+
+                self.output.text += data["content"]
+
+                self.application.invalidate()
 
         elif event == "provider_response":
             msg = data["message"]
 
-            if hasattr(msg, "content") and hasattr(msg.content, "text") and msg.content.text:
-                if not getattr(self, "streaming_enabled", False):
-                    console.print(
-                        Panel(
-                            msg.content.text,
-                            title="Assistant",
-                            border_style="green",
-                        )
+            if (
+                hasattr(msg, "content")
+                and hasattr(msg.content, "text")
+                and msg.content.text
+            ):
+                if not self.streaming_enabled:
+
+                    self.append_output(
+                        f"\n[Assistant]\n{msg.content.text}\n"
                     )
 
         elif event == "tool_call":
@@ -135,38 +196,49 @@ class AgentTUI:
 
             if self._streaming_active:
                 self._streaming_active = False
+                self.append_output("")
 
-            render_tool_call(tool_name, args)
+            text = render_tool_call(tool_name, args)
+            if text:
+                self.append_output(text)
 
         elif event == "tool_started":
             pass
 
         elif event == "tool_finished":
-            tool = data["tool"]
+            tool = data.get("tool")
             result = data.get("result")
 
-            render_tool_result(
-                tool,
-                result,
-            )
+            text = render_tool_result(tool, result)
+            if text:
+                self.append_output(text)
 
         elif event == "tool_error":
 
-            console.print(
-                f"[red]Error[/red]: {data['error']}"
+            self.append_output(
+                f"\n[Tool Error] {data['error']}\n"
             )
 
         elif event == "approval_requested":
-            answer = prompt(
-                f"\nAllow tool {data['tool']}? [y/N/a]: "
+            tool_name = data.get("tool")
+            self.append_output(f"\n[Approval Required] {tool_name}\n")
+
+            choice = prompt(
+                "Approve? [y]es / [n]o / [a]lways / [s]afe: "
             ).strip().lower()
 
-            if answer == "a":
+            if choice in {"y", "yes"}:
+                self.agent.resolve_approval(True)
+            elif choice in {"n", "no"}:
+                self.agent.resolve_approval(False)
+            elif choice in {"a", "always"}:
                 self.agent.approve_mode = "always"
                 self.agent.resolve_approval(True)
-            elif answer in {"y", "yes"}:
+            elif choice in {"s", "safe"}:
+                self.agent.approve_mode = "safe"
                 self.agent.resolve_approval(True)
             else:
+                self.append_output("Invalid choice, rejecting by default")
                 self.agent.resolve_approval(False)
 
         elif event == "context_compressed":
@@ -174,111 +246,89 @@ class AgentTUI:
             before = data.get("before_tokens")
             after = data.get("after_tokens")
 
-            console.print(
-                Panel(
-                    (
-                        f"Before: {before} tokens\n"
-                        f"After:  {after} tokens"
-                    ),
-                    title="Context Compressed",
-                    border_style="yellow",
-                )
+            self.append_output(
+                f"\n[Context Compressed]\n"
+                f"Before: {before} tokens\n"
+                f"After:  {after} tokens\n"
             )
 
         elif event == "context_compression_error":
-            console.print(
-                Panel(
-                    data["error"],
-                    title="Compression Error",
-                    border_style="red",
-                )
+
+            self.append_output(
+                f"\n[Compression Error]\n"
+                f"{data['error']}\n"
             )
 
         elif event == "task_error":
-            console.print(
-                Panel(
-                    data["error"],
-                    title=f"Task {data['task_id']} Error",
-                    border_style="red",
-                )
+
+            self.append_output(
+                f"\n[Task {data['task_id']} Error]\n"
+                f"{data['error']}\n"
             )
 
         elif event == "task_finished":
-            self._streaming_active = False
+            if self._streaming_active:
+                self.output.text += "\n"
+                self._streaming_active = False
+
             save_workspace(self.agent)
 
     def show_help(self):
+        self.append_output("""
+    HELP
 
-        console.print(
-            Panel.fit(
-                """
-/help                 Show help
-?                     Show help
-/tools                Show tools
-/models               Show available models
-/model                Show current model
-/model <name>         Change model
-/model next           Next model
-/reload               Reload models
-/settings             Show settings
-/context              Context info
-/history              Show conversation history
-/reset                Reset context
-/approve              Show mode
-/approve safe
-/approve always
-/approve never
-/clear
-/cls
-/quit
-/provider             Show provider
-/provider openai
-/provider openrouter
-/baseurl              Show current base url
-/baseurl <url>        Change base url
-/set_context_length <tokens>  Set max context length
-/compress_context
-/steer,          
-/steer add,    
-/steer clear",
-/mcp                  Show MCP servers
-/mcp add <url>        Add MCP server
-/mcp remove <index>   Remove MCP server
-/mcp reload           Reload MCP tools
-                """.strip(),
-                title="Help",
-                border_style="blue",
-            )
-        )
+    /help                 Show help
+    ?                     Show help
+    /tools                Show tools
+    /models               Show available models
+    /model                Show current model
+    /model <name>         Change model
+    /model next           Next model
+    /reload               Reload models
+    /settings             Show settings
+    /context              Context info
+    /history              Show conversation history
+    /reset                Reset context
+    /approve              Show mode
+    /approve safe
+    /approve always
+    /approve never
+    /clear
+    /cls
+    /quit
+    /provider             Show provider
+    /provider openai
+    /provider openrouter
+    /baseurl              Show current base url
+    /baseurl <url>        Change base url
+    /set_context_length <tokens>
+    /compress_context
+    /steer
+    /steer add
+    /steer clear
+    /mcp
+    /mcp add <url>
+    /mcp remove <index>
+    /mcp reload
+    """)
 
     def show_tools(self):
+        tools = "\n".join(
+            f"• {tool.name}"
+            for tool in self.agent.tools.values()
+        )
 
-        tools = []
-
-        for tool in self.agent.tools.values():
-            tools.append(tool.name)
-
-        console.print(
-            Panel(
-                "\n".join(
-                    f"• {tool}"
-                    for tool in tools
-                ),
-                title="Tools",
-                border_style="cyan",
-            )
+        self.append_output(
+            f"TOOLS\n\n{tools}"
         )
 
     def show_models(self):
-
         models = self.agent.provider.get_models()
 
         if isinstance(models, dict):
-
-            console.print(
-                f"[red]{models.get('error')}[/red]"
+            self.append_output(
+                f"ERROR: {models.get('error')}"
             )
-
             return
 
         current = self.agent.provider.model
@@ -286,74 +336,55 @@ class AgentTUI:
         rows = []
 
         for model in models:
+            marker = "●" if model == current else "○"
+            rows.append(f"{marker} {model}")
 
-            marker = (
-                "●"
-                if model == current
-                else "○"
-            )
-
-            rows.append(
-                f"{marker} {model}"
-            )
-
-        console.print(
-            Panel(
-                "\n".join(rows),
-                title=f"Models ({len(models)})",
-                border_style="magenta",
-            )
+        self.append_output(
+            "MODELS\n\n" +
+            "\n".join(rows)
         )
 
     def pick_model(self):
         try:
             models = self.agent.provider.get_models()
+
             if not isinstance(models, list) or not models:
-                console.print("[red]No models available[/red]")
+                self.append_output("No models available")
                 return
 
-            selected = prompt(
-                "Search model: ",
-                completer=FuzzyWordCompleter(models),
-                complete_while_typing=True,
-            ).strip()
+            self.append_output("Available models:\n" + "\n".join(
+                f"{i+1}: {m}" for i, m in enumerate(models)
+            ))
 
-            if selected in models:
-                self.set_model(selected)
-            else:
-                console.print(f"[red]Unknown model:[/red] {selected}")
+            self.append_output(
+                "To select a model, type: /model <model_name>"
+            )
 
         except Exception as e:
-            console.print(f"[red]Error picking model:[/red] {e}")
+            self.append_output(f"Error picking model: {e}")
 
     def set_model(self, model):
-
         models = self.agent.provider.get_models()
 
         if isinstance(models, list):
-
             if model not in models:
-
-                console.print(
-                    f"[red]Unknown model:[/red] {model}"
+                self.append_output(
+                    f"Unknown model: {model}"
                 )
-
                 return
 
         self.agent.provider.set_model(model)
 
         cfg = load_config()
-
         cfg["model"] = model
 
         save_config(cfg)
-
         save_workspace(self.agent)
 
         self.refresh_completer()
 
-        console.print(
-            f"[green]Model changed:[/green] {model}"
+        self.append_output(
+            f"Model changed: {model}"
         )
 
     def next_model(self):
@@ -380,57 +411,39 @@ class AgentTUI:
         self.set_model(model)
 
     def reload_models(self):
-
         self.refresh_completer()
 
-        console.print(
-            "[green]Models reloaded[/green]"
+        self.append_output(
+            "Models reloaded"
         )
 
     def show_context(self):
-
-        messages = self.agent.context.messages
-
-        console.print(
-            Panel(
-                f"Messages: {len(messages)}",
-                title="Context",
-                border_style="yellow",
-            )
+        self.append_output(
+            f"Context messages: {len(self.agent.context.messages)}"
         )
 
     def show_history(self):
-
         messages = self.agent.context.messages
 
         if not messages:
-
-            console.print(
-                "[yellow]History is empty[/yellow]"
-            )
-
+            self.append_output("History is empty")
             return
 
-        for idx, msg in enumerate(
-            messages,
-            start=1,
-        ):
-
+        for idx, msg in enumerate(messages, start=1):
             content = msg.content
 
             if hasattr(content, "text"):
                 content = content.text
 
-            console.print(
-                Panel(
-                    str(content)[:1500],
-                    title=f"{idx}. {msg.role}",
-                )
+            self.append_output(
+                f"\n[{idx}] {msg.role}\n"
+                f"{str(content)[:1500]}"
             )
 
     def reset_context(self):
-
-        self.agent.context = Context(provider=self.agent.provider)
+        self.agent.context = Context(
+            provider=self.agent.provider
+        )
 
         self.agent.context.compression_callback = (
             self.agent._on_context_compressed
@@ -438,42 +451,24 @@ class AgentTUI:
 
         save_workspace(self.agent)
 
-        console.print(
-            "[green]Context cleared[/green]"
+        self.append_output(
+            "Context cleared"
         )
 
     def show_approval_mode(self):
-
-        console.print(
-            Panel(
-                self.agent.approve_mode,
-                title="Approval Mode",
-                border_style="cyan",
-            )
+        self.append_output(
+            f"Approval mode: {self.agent.approve_mode}"
         )
 
     def show_provider(self):
-
-        console.print(
-            Panel(
-                self.agent.provider.__class__.__name__,
-                title="Provider",
-                border_style="cyan",
-            )
+        self.append_output(
+            f"Provider: {self.agent.provider.__class__.__name__}"
         )
 
     def show_base_url(self):
-
-        console.print(
-            Panel(
-                getattr(
-                    self.agent.provider,
-                    "base_url",
-                    "N/A"
-                ),
-                title="Base URL",
-                border_style="cyan",
-            )
+        self.append_output(
+            f"Base URL: "
+            f"{getattr(self.agent.provider, 'base_url', 'N/A')}"
         )
 
     def set_base_url(self, url):
@@ -495,8 +490,8 @@ class AgentTUI:
         save_config(cfg)
         save_workspace(self.agent)
 
-        console.print(
-            f"[green]Base URL:[/green] {url}"
+        self.append_output(
+            f"Base URL changed: {url}"
         )
 
     def set_context_length(self, length):
@@ -512,8 +507,8 @@ class AgentTUI:
         save_config(cfg)
         save_workspace(self.agent)
 
-        console.print(
-            f"[green]Context Length:[/green] {length} tokens"
+        self.append_output(
+            f"Context length: {length}"
         )
 
     def reset_provider(self):
@@ -527,9 +522,8 @@ class AgentTUI:
         save_config(cfg)
         save_workspace(self.agent)
 
-        console.print(
-            "[green]Provider reset.[/green]\n"
-            "Model and API keys removed."
+        self.append_output(
+            "Provider reset"
         )
 
     def switch_provider(self, provider_name):
@@ -634,26 +628,40 @@ class AgentTUI:
 
         self.refresh_completer()
 
-        console.print(
-            f"[green]Provider:[/green] {provider_name}"
+        self.append_output(
+            f"Provider: {provider_name}"
         )
 
     def show_steering(self):
         instructions = self.agent.steering.instructions
+
         if not instructions:
-            console.print("[yellow]No steering instructions[/yellow]")
+            self.append_output(
+                "No steering instructions"
+            )
             return
-        console.print(Panel("\n".join(f"• {x}" for x in instructions), title="Steering", border_style="cyan"))
+
+        self.append_output(
+            "STEERING\n\n" +
+            "\n".join(
+                f"• {x}"
+                for x in instructions
+            )
+        )
 
     def add_steering(self, text):
         self.agent.add_instruction(text)
         save_workspace(self.agent)
-        console.print(f"[green]Instruction added:[/green] {text}")
+        self.append_output(
+            f"Instruction added: {text}"
+        )
 
     def clear_steering(self):
         self.agent.clear_instructions()
         save_workspace(self.agent)
-        console.print("[green]Steering cleared[/green]")
+        self.append_output(
+            "Steering cleared"
+        )
 
     def show_mcp(self):
         cfg = load_config()
@@ -661,11 +669,17 @@ class AgentTUI:
         servers = cfg.get("mcp_servers", [])
 
         if not servers:
-            console.print("[yellow]No MCP servers[/yellow]")
+            self.append_output(
+                "No MCP servers"
+            )
             return
 
-        for idx, server in enumerate(servers):
-            console.print(f"{idx}: {server}")
+        self.append_output(
+            "\n".join(
+                f"{i}: {s}"
+                for i, s in enumerate(servers)
+            )
+        )
 
     def add_mcp(self, url):
         cfg = load_config()
@@ -680,8 +694,8 @@ class AgentTUI:
 
         save_config(cfg)
 
-        console.print(
-            f"[green]MCP added:[/green] {url}"
+        self.append_output(
+            f"MCP added: {url}"
         )
 
     def remove_mcp(self, index):
@@ -701,8 +715,8 @@ class AgentTUI:
 
         save_config(cfg)
 
-        console.print(
-            "[green]MCP removed[/green]"
+        self.append_output(
+            "MCP removed"
         )
 
     def reload_mcp(self):
@@ -714,8 +728,8 @@ class AgentTUI:
             new_agent.tools.values()
         )
 
-        console.print(
-            "[green]MCP tools reloaded[/green]"
+        self.append_output(
+            "MCP tools reloaded"
         )
 
     def set_approval_mode(self, mode):
@@ -724,70 +738,25 @@ class AgentTUI:
 
         save_workspace(self.agent)
 
-        console.print(
-            f"[green]Approval mode:[/green] {mode}"
+        self.append_output(
+            f"Approval mode: {mode}"
         )
 
     def show_settings(self):
-
         provider = self.agent.provider
 
-        table = Table(
-            title="Settings"
+        self.append_output(
+            "\n".join([
+                "SETTINGS",
+                "",
+                f"Provider : {provider.__class__.__name__}",
+                f"Model    : {provider.model}",
+                f"Base URL : {getattr(provider, 'base_url', '-')}",
+                f"Approval : {self.agent.approve_mode}",
+                f"Messages : {len(self.agent.context.messages)}",
+                f"Tools    : {len(self.agent.tools)}",
+            ])
         )
-
-        table.add_column(
-            "Key",
-            style="cyan"
-        )
-
-        table.add_column(
-            "Value"
-        )
-
-        table.add_row(
-            "Provider",
-            provider.__class__.__name__
-        )
-
-        table.add_row(
-            "Model",
-            provider.model
-        )
-
-        table.add_row(
-            "Base URL",
-            getattr(
-                provider,
-                "base_url",
-                "-"
-            )
-        )
-
-        table.add_row(
-            "Approval",
-            self.agent.approve_mode
-        )
-
-        table.add_row(
-            "Messages",
-            str(
-                len(
-                    self.agent.context.messages
-                )
-            )
-        )
-
-        table.add_row(
-            "Tools",
-            str(
-                len(
-                    self.agent.tools
-                )
-            )
-        )
-
-        console.print(table)
 
     def clear_screen(self):
 
@@ -802,8 +771,9 @@ class AgentTUI:
             return
 
         if text == "/quit":
-            console.print("[blue]Bye![/blue]")
-            raise EOFError
+            self.append_output("Bye!")
+            self.application.exit()
+            return
 
         elif text in {"/help", "?"}:
             return self.show_help()
@@ -881,7 +851,9 @@ class AgentTUI:
             mode = text.split(maxsplit=1)[1].strip()
 
             if mode not in {"safe", "always", "never"}:
-                console.print("[red]Use safe|always|never[/red]")
+                self.append_output(
+                    "Use safe|always|never"
+                )
                 return
 
             return self.set_approval_mode(mode)
@@ -890,8 +862,8 @@ class AgentTUI:
             length = text.split(maxsplit=1)[1].strip()
 
             if not length.isdigit():
-                console.print(
-                    "[red]Please enter a valid number of tokens.[/red]"
+                self.append_output(
+                    "Please enter a valid number of tokens"
                 )
                 return
 
@@ -904,8 +876,8 @@ class AgentTUI:
             url = text[len("/mcp add "):].strip()
 
             if not url:
-                console.print(
-                    "[red]Usage: /mcp add <url>[/red]"
+                self.append_output(
+                    "Usage: /mcp add <url>"
                 )
                 return
 
@@ -915,16 +887,16 @@ class AgentTUI:
             index = text[len("/mcp remove "):].strip()
 
             if not index.isdigit():
-                console.print(
-                    "[red]Usage: /mcp remove <index>[/red]"
+                self.append_output(
+                    "Usage: /mcp remove <index>"
                 )
                 return
 
             try:
                 return self.remove_mcp(int(index))
             except (IndexError, ValueError):
-                console.print(
-                    "[red]Invalid MCP index[/red]"
+                self.append_output(
+                    "Invalid MCP index"
                 )
                 return
 
@@ -942,58 +914,33 @@ class AgentTUI:
         if not self.agent.running:
             self.agent.start_queue()
 
+    def get_status_text(self):
+        model = self.agent.provider.model.split("/")[-1]
+
+        folder = os.path.basename(os.getcwd())
+
+        tokens = self.agent.context.estimate_tokens()
+        max_tokens = self.agent.context.max_tokens
+        usage = self.agent.context.usage_percent()
+
+        return (
+            f"{model} "
+            f"{folder} "
+            f"[{tokens}/{max_tokens} | {usage:.0f}%]"
+        )
+
     def run(self):
-        while True:
-            try:
-                model_name = (
-                    self.agent.provider.model
-                    .split("/")[-1]
-                )
+        try:
+            self.application.run()
 
-                cwd = os.getcwd()
-                folder = os.path.basename(cwd)
-                
-                usage = self.agent.context.usage_percent()
+        except KeyboardInterrupt:
+            self.append_output("\nInterrupted")
 
-                tokens = self.agent.context.estimate_tokens()
-                max_tokens = self.agent.context.max_tokens
-                usage = self.agent.context.usage_percent()
+        except EOFError:
+            self.append_output("\nBye!")
 
-                if usage < 50:
-                    color = "ansigreen"
-                elif usage < 80:
-                    color = "ansiyellow"
-                else:
-                    color = "ansired"
-
-                text = prompt(
-                    HTML(
-                        f"<ansiblue>{model_name}</ansiblue> "
-                        f"<ansigreen>{folder}</ansigreen> "
-                        f"<{color}>[{tokens}/{max_tokens} | {usage:.0f}%]</{color}> "
-                        "<ansicyan>❯ </ansicyan>"
-                    ),
-                    completer=self.completer,
-                    complete_while_typing=True,
-                ).strip()
-
-                self.handle_command(text)
-
-            except KeyboardInterrupt:
-                console.print(
-                    "\n[yellow]Interrupted[/yellow]"
-                )
-
-            except EOFError:
-                console.print(
-                    "\n[blue]Bye![/blue]"
-                )
-                break
-
-            except Exception as e:
-                console.print(
-                    f"[red]{e}[/red]"
-                )
+        except Exception as e:
+            self.append_output(f"\nError: {e}")
 
 def main():
 
@@ -1003,22 +950,17 @@ def main():
 
     agent.event_callback = tui.event_handler
 
-    console.print(
-        Panel.fit(
-            f"""  
-██     ██        ██        ██     ██ 
-██     ██       ████       ██     ██ 
- ██   ██       ██  ██       ██   ██
-  ██ ██       ████████       ██ ██ 
-   ███       ██      ██       ███ 
-   ███       ██      ██       ███ 
-   ███      ██        ██      ███ 
+    tui.append_output(
+    """
+ ██     ██        ██        ██     ██ 
+ ██     ██       ████       ██     ██ 
+  ██   ██       ██  ██       ██   ██
+   ██ ██       ████████       ██ ██ 
+    ███       ██      ██       ███ 
+    ███       ██      ██       ███ 
+    ███      ██        ██      ███ 
 
-        Yet Another Yielder
-
-            """.strip(),
-            border_style="blue",
-        )
+            Yet Another Yielder
+    """
     )
-
     tui.run()

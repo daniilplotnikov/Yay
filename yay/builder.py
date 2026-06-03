@@ -89,7 +89,7 @@ def build_agent():
     if not provider_name:
         provider = NonSelectedProvider()
 
-    if provider_name == "openrouter":
+    elif provider_name == "openrouter":
         api_key = get_provider_api_key(cfg, "openrouter")
         if not api_key:
             provider = NonSelectedProvider()
@@ -127,43 +127,15 @@ def build_agent():
 
     try:
         models = provider.get_models()
+
         if (
             isinstance(models, list)
             and models
         ):
-            if not cfg["model"]:
-                console.print(
-                    "\n[cyan]Select model:[/cyan]"
-                )
-                for idx, model in enumerate(
-                    models,
-                    start=1,
-                ):
-                    console.print(
-                        f"{idx}. {model}"
-                    )
-                while True:
-                    try:
-                        choice = int(
-                            input(
-                                "\nModel number: "
-                            )
-                        )
-                        if (
-                            1 <= choice <= len(models)
-                        ):
-                            break
-                    except Exception:
-                        pass
-                provider.model = models[
-                    choice - 1
-                ]
-                cfg["model"] = (
-                    provider.model
-                )
-                save_config(cfg)
-            else:
-                provider.model = cfg["model"]
+            provider.model = (
+                cfg.get("model")
+                or models[0]
+            )
 
     except Exception:
         pass
