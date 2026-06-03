@@ -8,6 +8,7 @@ import difflib
 class CreateFileTool(Tool):
     def __init__(self):
         super().__init__()
+        self.name = "CreateFile"
         self.description = "Create a new file with content"
 
         self.arguments = {
@@ -69,6 +70,7 @@ class CreateDirectoryTool(Tool):
     def __init__(self):
         super().__init__()
 
+        self.name = "CreateDirectory"
         self.description = "Create directory"
 
         self.arguments = {
@@ -96,6 +98,7 @@ class RemoveFileTool(Tool):
     def __init__(self):
         super().__init__()
 
+        self.name = "RemoveFile"
         self.description = "Delete one or more files"
 
         self.arguments = {
@@ -175,6 +178,7 @@ class TreeTool(Tool):
     def __init__(self):
         super().__init__()
 
+        self.name = "Tree"
         self.description = (
             "Show directory tree"
         )
@@ -265,6 +269,7 @@ class TreeTool(Tool):
 class ListFilesTool(Tool):
     def __init__(self):
         super().__init__()
+        self.name = "ListFiles"
         self.description = "List files in directory"
 
         self.arguments = {
@@ -283,6 +288,7 @@ class ListFilesTool(Tool):
 class SearchTool(Tool):
     def __init__(self):
         super().__init__()
+        self.name = "Search"
         self.description = "Search text inside files (simple grep)"
 
         self.arguments = {
@@ -321,7 +327,8 @@ class SearchTool(Tool):
 class PatchFileTool(Tool):
     def __init__(self):
         super().__init__()
-
+ 
+        self.name = "PatchFile"
         self.description = "Apply search/replace patches to file"
 
         self.is_safe = False
@@ -435,6 +442,7 @@ class PatchFileTool(Tool):
 class ReadFileTool(Tool):
     def __init__(self):
         super().__init__()
+        self.name = "ReadFile"
         self.description = "Read a file from disk"
 
         self.arguments = {
@@ -478,6 +486,7 @@ class ReadFileTool(Tool):
 class GetFileInfoTool(Tool):
     def __init__(self):
         super().__init__()
+        self.name = "GetFileInfo"
         self.description = "Get metadata about a file (size, timestamps, type)"
 
         self.arguments = {
@@ -520,6 +529,7 @@ class GrepTool(Tool):
     def __init__(self):
         super().__init__()
 
+        self.name = "Grep"
         self.description = "Search text inside files"
 
         self.arguments = {
@@ -583,6 +593,7 @@ class GlobTool(Tool):
     def __init__(self):
         super().__init__()
 
+        self.name = "Glob"
         self.description = (
             "Find files by glob pattern"
         )
@@ -629,6 +640,7 @@ class PDFTool(Tool):
     def __init__(self):
         super().__init__()
 
+        self.name = "PDF"
         self.description = "Read text from PDF file"
 
         self.arguments = {

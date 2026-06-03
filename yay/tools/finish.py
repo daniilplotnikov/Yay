@@ -3,6 +3,7 @@ from .. tool import Tool
 class FinishTaskTool(Tool):
     def __init__(self):
         super().__init__()
+        self.name = "FinishTask"
         self.description = "Finish current task and return final summary"
 
         self.arguments = {

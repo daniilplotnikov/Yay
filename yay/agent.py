@@ -8,9 +8,9 @@ import threading
 import json
 
 ApproveMode = Literal[
-    "safe",
-    "always",
-    "never",
+    "ask_all",
+    "ask_unsafe",
+    "auto_approve",
 ]
 
 class Agent:
@@ -41,31 +41,50 @@ class Agent:
         self._approval_event = threading.Event()
         self._approval_result: Optional[bool] = None
 
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # not paused by default
+
         self.task_queue = Queue()
         self.worker_thread = None
         self.running = False
+
+        self.current_task = None
 
     def emit(self, event: str, data=None):
         if self.event_callback:
             self.event_callback(event, data or {})
 
+    def pause(self):
+        self._pause_event.clear()
+
+    def resume(self):
+        self._pause_event.set()
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._pause_event.is_set()
+
+    def wait_if_paused(self):
+        self._pause_event.wait()
+
     def run_tool(self, tool_name: str, args: Dict[str, Any]):
         tool = self.tools.get(tool_name)
         if not tool:
             raise ValueError(f"Unknown tool: {tool_name}")
-
         return tool.run(args)
 
     def needs_approval(self, tool_name: str) -> bool:
         tool = self.tools.get(tool_name)
-        if not tool:
+
+        if self.approve_mode == "auto_approve":
             return False
-        if self.approve_mode == "always":
-            return True 
-        if self.approve_mode == "never":
-            return False
-        if self.approve_mode == "safe":
+
+        if self.approve_mode == "ask_all":
+            return True
+
+        if self.approve_mode == "ask_unsafe":
             return not tool.is_safe
+
         return False
 
     def request_approval(self, tool_name, args):
@@ -74,7 +93,7 @@ class Agent:
 
         self.emit("approval_requested", {
             "tool": tool_name,
-            "args": args
+            "args": args,
         })
 
         if self.approval_callback:
@@ -107,7 +126,6 @@ class Agent:
             and tool["calls"]
         ):
             call = tool["calls"][0]
-
             return {
                 "id": call.get("id"),
                 "name": call.get("name"),
@@ -126,31 +144,39 @@ class Agent:
 
         return None
 
+    def _build_steering_prompt(self) -> Optional[str]:
+        """Возвращает строку steering-инструкций или None."""
+        if not self.steering.instructions:
+            return None
+        return "\n".join(self.steering.instructions)
+
     def work_loop(self, prompt: str):
         self.emit("task_started", {"prompt": prompt})
+
+        steering_text = self._build_steering_prompt()
+        if steering_text:
+            full_prompt = f"{steering_text}\n\n{prompt}"
+        else:
+            full_prompt = prompt
 
         self.context.append(
             Message(
                 role="user",
-                content=Content(text=prompt),
+                content=Content(text=full_prompt),
                 tool=None,
             )
         )
 
         self._compress_context_if_needed()
 
-        steering = self._build_steering_message()
-
-        if steering:
-            self.context.append(steering)
-
         while True:
+            self.wait_if_paused()
 
             self.emit("model_processing")
 
             response = self.provider.process_stream(
                 self.context,
-                on_chunk=lambda data: self.emit("stream_chunk", data)
+                on_chunk=lambda data: self.emit("stream_chunk", data),
             )
 
             self.context.append(response)
@@ -161,14 +187,10 @@ class Agent:
                 {"message": response},
             )
 
-            tool_call = self._extract_tool_call(
-                response
-            )
+            tool_call = self._extract_tool_call(response)
 
             if tool_call is None:
-
                 text = ""
-
                 if (
                     hasattr(response, "content")
                     and response.content
@@ -181,16 +203,11 @@ class Agent:
 
                 if not text:
                     raise RuntimeError(
-                        "Model returned empty response"
+                        f"Model returned empty response (no tool call, no text). "
+                        f"Raw content: {repr(getattr(response.content, 'text', None))}"
                     )
 
-                self.emit(
-                    "task_finished",
-                    {
-                        "result": text
-                    }
-                )
-
+                self.emit("task_finished", {"result": text})
                 return text
 
             tool_name = tool_call.get("name")
@@ -206,20 +223,10 @@ class Agent:
             )
 
             if self.needs_approval(tool_name):
-
-                approved = self.request_approval(
-                    tool_name,
-                    args,
-                )
+                approved = self.request_approval(tool_name, args)
 
                 if not approved:
-
-                    self.emit(
-                        "approval_denied",
-                        {"tool": tool_name},
-                    )
-
-                    result = "Tool execution denied by user"
+                    self.emit("approval_denied", {"tool": tool_name})
 
                     self.context.append(
                         Message(
@@ -227,36 +234,21 @@ class Agent:
                             tool=tool_name,
                             tool_call_id=tool_call_id,
                             content=Content(
-                                text=json.dumps(
-                                    result,
-                                    ensure_ascii=False,
-                                )
-                                if not isinstance(result, str)
-                                else result
+                                text="Tool execution denied by user"
                             ),
                         )
                     )
-
                     self._compress_context_if_needed()
-
                     continue
 
-                self.emit(
-                    "approval_granted",
-                    {"tool": tool_name},
-                )
+                self.emit("approval_granted", {"tool": tool_name})
 
-            self.emit(
-                "tool_started",
-                {"tool": tool_name},
-            )
+            self.emit("tool_started", {"tool": tool_name})
+
+            self.wait_if_paused()
 
             try:
-
-                result = self.run_tool(
-                    tool_name,
-                    args,
-                )
+                result = self.run_tool(tool_name, args)
 
                 self.emit(
                     "tool_finished",
@@ -267,7 +259,6 @@ class Agent:
                 )
 
             except Exception as e:
-
                 result = {"error": str(e)}
 
                 self.emit(
@@ -284,10 +275,7 @@ class Agent:
                     tool=tool_name,
                     tool_call_id=tool_call_id,
                     content=Content(
-                        text=json.dumps(
-                            result,
-                            ensure_ascii=False,
-                        )
+                        text=json.dumps(result, ensure_ascii=False)
                         if not isinstance(result, str)
                         else result
                     ),
@@ -296,12 +284,7 @@ class Agent:
             self._compress_context_if_needed()
 
             if tool_name == "FinishTaskTool":
-
-                self.emit(
-                    "task_finished",
-                    {"result": result},
-                )
-
+                self.emit("task_finished", {"result": result})
                 return result
 
     def _queue_loop(self):
@@ -309,14 +292,26 @@ class Agent:
             try:
                 task = self.task_queue.get(timeout=1.0)
             except Exception:
-                continue 
+                continue
+
+            self.current_task = task
+
             try:
                 self.work_loop(task.prompt)
+
             except Exception as e:
-                self.emit("task_error", {"task_id": task.task_id, "error": str(e)})
-            self.task_queue.task_done()
-        self.running = False 
-            
+                self.emit(
+                    "task_error",
+                    {
+                        "task_id": task.task_id,
+                        "error": str(e),
+                    },
+                )
+
+            finally:
+                self.current_task = None
+                self.task_queue.task_done()
+
     def enqueue(self, prompt: str, task_id: str, metadata=None):
         self.task_queue.put(
             Task(
@@ -330,7 +325,10 @@ class Agent:
         if self.running:
             return
         self.running = True
-        self.worker_thread = threading.Thread(target=self._queue_loop, daemon=True)
+        self.worker_thread = threading.Thread(
+            target=self._queue_loop,
+            daemon=True,
+        )
         self.worker_thread.start()
 
     def stop_queue(self):
@@ -342,35 +340,11 @@ class Agent:
         except Exception as e:
             self.emit(
                 "context_compression_error",
-                {
-                    "error": str(e),
-                },
+                {"error": str(e)},
             )
-            
-    def _on_context_compressed(
-        self,
-        info: Dict[str, Any],
-    ):
-        self.emit(
-            "context_compressed",
-            info,
-        )
 
-    def _build_steering_message(self):
-        if not self.steering.instructions:
-            return None
+    def _on_context_compressed(self, info: Dict[str, Any]):
+        self.emit("context_compressed", info)
 
-        return Message(
-            role="system",
-            content=Content(
-                text="\n".join(
-                    self.steering.instructions
-                )
-            ),
-        )
-    
     def replace_tools(self, tools):
-        self.tools = {
-            tool.name: tool
-            for tool in tools
-        }
+        self.tools = {tool.name: tool for tool in tools}

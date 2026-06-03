@@ -4,6 +4,7 @@ class ThinkTool(Tool):
     def __init__(self):
         super().__init__()
 
+        self.name = "Think"
         self.description = (
             "Internal reasoning step. "
             "Use to plan before acting."

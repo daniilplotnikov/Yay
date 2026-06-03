@@ -212,7 +212,9 @@ class OpenAICompatibleProvider(Provider):
                 for tc in delta.tool_calls:
                     idx = tc.index
                     if idx not in tool_calls:
-                        tool_calls[idx] = {"id": tc.id, "name": "", "arguments": ""}
+                        tool_calls[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
+                    elif tc.id:
+                        tool_calls[idx]["id"] = tc.id  
                     fn = getattr(tc, "function", None)
                     if fn:
                         if getattr(fn, "name", None):
