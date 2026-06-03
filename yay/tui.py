@@ -557,6 +557,8 @@ class ModelPickerModal(ModalScreen):
         background: $surface; border: round $accent; padding: 1 2;
     }
     .modal-title { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
+    #model-search { border: solid $accent; margin-bottom: 1; }
+    #model-list   { height: 1fr; border: solid $panel; }    
     """
 
     def __init__(self, models: list[str], current: str) -> None:
@@ -653,6 +655,7 @@ class StreamView(Static):
 class AgentTUI(App):
     CSS = """
     Screen { layers: base; }
+    #log {
         height: 1fr;
         border: none;
         padding: 0 2;
@@ -665,6 +668,7 @@ class AgentTUI(App):
         padding: 0 2;
         background: $background;
     }
+    #input-bar {        
         height: 3;
         border-top: solid $accent;
         background: $surface;
@@ -672,16 +676,19 @@ class AgentTUI(App):
         layout: horizontal;
         align: left middle;
     }
-        width: auto;
+    #prompt-label {
+            width: auto;
         color: $accent;
         padding: 0 1 0 0;
         content-align: left middle;
     }
+    #cmd-input {
         height: 1;
         width: 1fr;
         border: none;
         background: transparent;
     }
+    #cmd-input:focus { border: none; }
     Footer { height: 1; }
     """
 
