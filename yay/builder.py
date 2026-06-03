@@ -5,7 +5,7 @@ from .workspace import Context, load_workspace
 from .config import load_config, save_config
 from .tools.mcp import MCPClient
 from .tools import (
-    CMDTool,
+    ShellTool,
     FinishTaskTool,
     CreateFileTool,
     RemoveFileTool,
@@ -48,7 +48,7 @@ def get_provider_api_key(cfg, provider_name):
 
 def build_agent():
     tools = [
-        CMDTool(),
+        ShellTool(),
         FinishTaskTool(),
         CreateFileTool(),
         RemoveFileTool(),

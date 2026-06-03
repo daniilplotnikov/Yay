@@ -1,9 +1,10 @@
 from ..tool import Tool
 import subprocess
 
-class CMDTool(Tool):
+class ShellTool(Tool):
     def __init__(self):
         super().__init__()
+        self.name = "Shell"
         self.description = "Run shell command (blocking or background) with process management via execute()"
 
         self.arguments = {
