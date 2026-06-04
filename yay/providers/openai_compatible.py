@@ -4,6 +4,7 @@ import traceback
 from openai import OpenAI
 from ..llm import Message, Content
 from ..provider import Provider
+from ..managers import ToolsManager
 
 
 class OpenAICompatibleProvider(Provider):
@@ -16,15 +17,19 @@ class OpenAICompatibleProvider(Provider):
         api_key: str,
         model: str,
         base_url: str,
-        tools: list = None,
+        tools_manager: ToolsManager,
     ):
+        self._api_key = api_key
+        self._base_url = base_url
+
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
         )
 
+        self.name = "OpenAICompatibleProvider"
         self.model = model
-        self.tools = tools or []
+        self.tools_manager = tools_manager
 
         try:
             self.context_length = self._detect_context_size()
@@ -33,24 +38,17 @@ class OpenAICompatibleProvider(Provider):
 
     def _request(self, **kwargs):
         last_error = None
-
         for attempt in range(self.RETRY_COUNT):
             try:
                 return self.client.chat.completions.create(**kwargs)
-
             except Exception as e:
                 last_error = e
-
                 if attempt < self.RETRY_COUNT - 1:
-                    time.sleep(
-                        self.RETRY_DELAY * (attempt + 1)
-                    )
-
+                    time.sleep(self.RETRY_DELAY * (attempt + 1))
         raise last_error
 
-    def _messages(self, context):
+    def _messages(self, context) -> list:
         messages = []
-
         for m in context.messages:
             text = getattr(getattr(m, "content", None), "text", "") or ""
 
@@ -60,44 +58,45 @@ class OpenAICompatibleProvider(Provider):
                 if isinstance(tool_data, dict) and "calls" in tool_data:
                     for call in tool_data["calls"]:
                         calls.append({
-                            "id": call.get("id"),
+                            "id": call.get("id") or "",
                             "type": "function",
                             "function": {
-                                "name": call.get("name"),
+                                "name": call.get("name", ""),
                                 "arguments": json.dumps(call.get("arguments", {})),
-                            }
+                            },
                         })
-
-                messages.append({
-                    "role": "assistant",
-                    "content": text,
-                    "tool_calls": calls,
-                })
+                msg: dict = {"role": "assistant", "content": text or None}
+                if calls:
+                    msg["tool_calls"] = calls
+                messages.append(msg)
                 continue
 
             if m.role == "tool":
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": getattr(
-                        m,
-                        "tool_call_id",
-                        ""
-                    ),
+                    "tool_call_id": getattr(m, "tool_call_id", "") or "",
                     "content": text,
                 })
+                continue
+
+            if m.role == "assistant":
+                messages.append({"role": "assistant", "content": text or ""})
                 continue
 
             if not text.strip():
                 continue
 
-            messages.append({
-                "role": m.role,
-                "content": text,
-            })
+            messages.append({"role": m.role, "content": text})
 
         return messages
 
-    def _tools(self):
+    def _tools(self) -> list | None:
+
+        if not self.tools_manager:
+            return None
+        tools = self.tools_manager.get_tools()
+        if not tools:
+            return None
         return [
             {
                 "type": "function",
@@ -107,105 +106,175 @@ class OpenAICompatibleProvider(Provider):
                     "parameters": tool.arguments,
                 },
             }
-            for tool in self.tools
+            for tool in tools.values()
         ]
 
-    def get_models(self):
+    @staticmethod
+    def _parse_tool_calls(raw_calls: list) -> list:
+        calls = []
+        for tc in raw_calls:
+            try:
+                args = json.loads(tc.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            calls.append({
+                "id":        tc.get("id", ""),
+                "name":      tc.get("name", ""),
+                "arguments": args,
+            })
+        return calls
+    
+    def get_models(self) -> list | dict:
         try:
             models = self.client.models.list()
-            result = [getattr(model, "id", None) for model in getattr(models, "data", []) if getattr(model, "id", None)]
+            result = [
+                getattr(model, "id", None)
+                for model in getattr(models, "data", [])
+                if getattr(model, "id", None)
+            ]
             return sorted(result)
         except Exception as e:
             return {"error": str(e)}
 
-    def set_model(self, model):
+    def set_model(self, model: str) -> None:
         self.model = model
-        self.context_length = (
-            self._detect_context_size()
-        )
+        try:
+            self.context_length = self._detect_context_size()
+        except Exception:
+            pass 
 
-    def set_base_url(self, base_url: str):
-        self.client.base_url = base_url
+    def set_base_url(self, base_url: str) -> str:
+        self._base_url = base_url
+        self.client = OpenAI(api_key=self._api_key, base_url=base_url)
         return base_url
 
-    def process(self, context):
-
-        response = self._request(
+    def process(self, context) -> Message:
+        tools = self._tools()
+        kwargs: dict = dict(
             model=self.model,
             messages=self._messages(context),
-            tools=self._tools() if self.tools else None,
-            tool_choice="auto",
         )
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
 
+        response = self._request(**kwargs)
         msg = response.choices[0].message
 
-        content_text = (
-            getattr(msg, "content", "")
-            or ""
-        )
+        content_text = getattr(msg, "content", None) or ""
 
-        tool_calls = getattr(
-            msg,
-            "tool_calls",
-            None,
-        )
-
-        if tool_calls:
+        raw_tool_calls = getattr(msg, "tool_calls", None)
+        if raw_tool_calls:
             calls = []
-
-            for tc in tool_calls:
+            for tc in raw_tool_calls:
                 try:
                     args = json.loads(
-                        getattr(
-                            tc.function,
-                            "arguments",
-                            "{}",
-                        )
-                        or "{}"
+                        getattr(tc.function, "arguments", "{}") or "{}"
                     )
                 except Exception:
                     args = {}
-
-                calls.append(
-                    {
-                        "id": tc.id,
-                        "name": tc.function.name,
-                        "arguments": args,
-                    }
-                )
-
+                calls.append({
+                    "id":        tc.id or "",
+                    "name":      tc.function.name or "",
+                    "arguments": args,
+                })
             return Message(
                 role="assistant",
-                content=Content(
-                    text=content_text
-                ),
+                content=Content(text=content_text),
                 tool={"calls": calls},
             )
 
         return Message(
             role="assistant",
-            content=Content(
-                text=content_text
-            ),
+            content=Content(text=content_text),
             tool=None,
         )
 
-    def summarize(self, messages):
-        history = []
+    def process_stream(self, context, on_chunk=None) -> Message:
+        tools = self._tools()
+        stream_kwargs: dict = dict(
+            model=self.model,
+            messages=self._messages(context),
+            stream=True,
+        )
+        if tools:
+            stream_kwargs["tools"] = tools
+            stream_kwargs["tool_choice"] = "auto"
 
-        for m in messages:
-            text = getattr(
-                getattr(m, "content", None),
-                "text",
-                "",
-            )
+        stream = None
+        last_error = None
+        for attempt in range(self.RETRY_COUNT):
+            try:
+                stream = self.client.chat.completions.create(**stream_kwargs)
+                break
+            except Exception as e:
+                last_error = e
+                print(f"[STREAM] attempt {attempt + 1}/{self.RETRY_COUNT}: {e}")
+                if attempt < self.RETRY_COUNT - 1:
+                    time.sleep(self.RETRY_DELAY * (attempt + 1))
 
-            if text.strip():
-                history.append(
-                    f"[{m.role}] {text}"
+        if stream is None:
+            raise last_error
+
+        content: list[str] = []
+        tool_calls: dict[int, dict] = {} 
+
+        try:
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+
+                delta = chunk.choices[0].delta
+
+                if getattr(delta, "content", None):
+                    text = delta.content
+                    content.append(text)
+                    if on_chunk:
+                        on_chunk({"type": "text", "content": text})
+
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    idx = tc.index
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+
+                    if tc.id:
+                        tool_calls[idx]["id"] = tc.id
+
+                    fn = getattr(tc, "function", None)
+                    if fn:
+                        if getattr(fn, "name", None):
+                            tool_calls[idx]["name"] += fn.name
+                        if getattr(fn, "arguments", None):
+                            tool_calls[idx]["arguments"] += fn.arguments
+
+        except Exception as e:
+            print("[STREAM ERROR]", repr(e))
+            traceback.print_exc()
+
+            if content:
+                return Message(
+                    role="assistant",
+                    content=Content(text="".join(content)),
+                    tool=None,
                 )
+            raise
 
-        response = self.client.chat.completions.create(
+        calls = self._parse_tool_calls(list(tool_calls.values()))
+
+        return Message(
+            role="assistant",
+            content=Content(text="".join(content)),
+            tool={"calls": calls} if calls else None,
+        )
+
+    def summarize(self, messages) -> str:
+        history = []
+        for m in messages:
+            text = getattr(getattr(m, "content", None), "text", "") or ""
+            if text.strip():
+                history.append(f"[{m.role}] {text}")
+
+        response = self._request(
             model=self.model,
             messages=[
                 {
@@ -218,247 +287,60 @@ class OpenAICompatibleProvider(Provider):
                 },
                 {
                     "role": "user",
-                    "content": "\n".join(history),
+                    "content": "\n".join(history) or "(empty conversation)",
                 },
             ],
         )
+        return response.choices[0].message.content or "Conversation summary unavailable."
 
-        return (
-            response.choices[0]
-            .message
-            .content
-            or "Conversation summary unavailable."
-        )
-
-    def process_stream(
-        self,
-        context,
-        on_chunk=None,
-    ):
-
-        stream = None
-
-        last_error = None
-
-        for attempt in range(self.RETRY_COUNT):
-            try:
-                stream = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self._messages(
-                        context
-                    ),
-                    tools=self._tools()
-                    if self.tools
-                    else None,
-                    tool_choice="auto",
-                    stream=True,
-                )
-
-                break
-
-            except Exception as e:
-                last_error = e
-
-                print(
-                    f"[STREAM] attempt "
-                    f"{attempt + 1}/"
-                    f"{self.RETRY_COUNT}: {e}"
-                )
-
-                if attempt < (
-                    self.RETRY_COUNT - 1
-                ):
-                    time.sleep(
-                        self.RETRY_DELAY
-                        * (attempt + 1)
-                    )
-
-        if stream is None:
-            raise last_error
-
-        content = []
-        tool_calls = {}
-
-        try:
-
-            for chunk in stream:
-
-                if not chunk.choices:
-                    continue
-
-                delta = (
-                    chunk.choices[0].delta
-                )
-
-                if getattr(
-                    delta,
-                    "content",
-                    None,
-                ):
-                    text = delta.content
-
-                    content.append(text)
-
-                    if on_chunk:
-                        on_chunk(
-                            {
-                                "type": "text",
-                                "content": text,
-                            }
-                        )
-
-                if getattr(
-                    delta,
-                    "tool_calls",
-                    None,
-                ):
-                    for tc in delta.tool_calls:
-
-                        idx = tc.index
-
-                        if idx not in tool_calls:
-                            tool_calls[idx] = {
-                                "id": "",
-                                "name": "",
-                                "arguments": "",
-                            }
-
-                        if tc.id:
-                            tool_calls[idx][
-                                "id"
-                            ] = tc.id
-
-                        fn = getattr(
-                            tc,
-                            "function",
-                            None,
-                        )
-
-                        if fn:
-
-                            if getattr(
-                                fn,
-                                "name",
-                                None,
-                            ):
-                                tool_calls[idx][
-                                    "name"
-                                ] += fn.name
-
-                            if getattr(
-                                fn,
-                                "arguments",
-                                None,
-                            ):
-                                tool_calls[idx][
-                                    "arguments"
-                                ] += fn.arguments
-
-        except Exception as e:
-
-            print(
-                "[STREAM ERROR]",
-                repr(e),
-            )
-
-            traceback.print_exc()
-
-            if content:
-                return Message(
-                    role="assistant",
-                    content=Content(
-                        text="".join(
-                            content
-                        )
-                    ),
-                    tool=None,
-                )
-
-            raise
-
-        calls = []
-
-        for tc in tool_calls.values():
-
-            try:
-                args = json.loads(
-                    tc["arguments"]
-                    or "{}"
-                )
-            except Exception:
-                args = {}
-
-            calls.append(
-                {
-                    "id": tc["id"],
-                    "name": tc["name"],
-                    "arguments": args,
-                }
-            )
-
-        return Message(
-            role="assistant",
-            content=Content(
-                text="".join(content)
-            ),
-            tool={
-                "calls": calls
-            }
-            if calls
-            else None,
-        )
-    
     def _detect_context_size(self) -> int:
-        def find_context(obj):
+        def find_context(obj, depth: int = 0) -> int | None:
+            if depth > 6:
+                return None
+
             if isinstance(obj, dict):
-                for target_key in ("context_length", "max_context_length", "context_window"):
-                    for k, v in obj.items():
-                        if k.lower() == target_key:
-                            try:
-                                return int(v)
-                            except (ValueError, TypeError):
-                                continue
-                
-                if "max_tokens" in obj:
-                    try:
-                        return int(obj["max_tokens"])
-                    except (ValueError, TypeError):
-                        pass
-                        
+                for key in ("context_length", "max_context_length",
+                            "context_window", "max_tokens"):
+                    val = obj.get(key)
+                    if val is not None:
+                        try:
+                            n = int(val)
+                            if n > 0:
+                                return n
+                        except (ValueError, TypeError):
+                            pass
+                # recurse into values (but not into strings/ints)
                 for v in obj.values():
-                    result = find_context(v)
-                    if result:
-                        return result
-                        
+                    if isinstance(v, (dict, list)) or hasattr(v, "__dict__"):
+                        result = find_context(v, depth + 1)
+                        if result:
+                            return result
+
             elif hasattr(obj, "__dict__"):
-                return find_context(vars(obj))
-                
-            elif isinstance(obj, (list, tuple, set)):
+                return find_context(vars(obj), depth)
+
+            elif isinstance(obj, (list, tuple)):
                 for item in obj:
-                    result = find_context(item)
-                    if result:
-                        return result
+                    if isinstance(item, (dict, list)) or hasattr(item, "__dict__"):
+                        result = find_context(item, depth + 1)
+                        if result:
+                            return result
+
             return None
 
         base_url_str = str(self.client.base_url).rstrip("/")
-        
+
         if "openrouter.ai" in base_url_str:
             try:
                 import requests
-                clean_url = base_url_str.split("/api/v1")[0] + "/api/v1/models"
-
+                api_root = base_url_str.split("/api/v1")[0]
                 response = requests.get(
-                    clean_url,
+                    f"{api_root}/api/v1/models",
                     timeout=10,
                 )
                 response.raise_for_status()
-                data = response.json()
-                
-                models = data.get("data", [])
-                for model in models:
+                for model in response.json().get("data", []):
                     if model.get("id") == self.model:
-                        if "context_length" in model:
-                            return int(model["context_length"])
                         result = find_context(model)
                         if result:
                             return result
@@ -467,13 +349,16 @@ class OpenAICompatibleProvider(Provider):
 
         try:
             models = self.client.models.list()
-            model_list = getattr(models, "data", models if isinstance(models, list) else [])
-            
-            for model in model_list:
-                model_id = getattr(model, "id", None) or (model.get("id") if isinstance(model, dict) else None)
+            model_list = getattr(models, "data", None)
+            if model_list is None and isinstance(models, list):
+                model_list = models
+            for model in (model_list or []):
+                model_id = (
+                    getattr(model, "id", None)
+                    or (model.get("id") if isinstance(model, dict) else None)
+                )
                 if model_id != self.model:
                     continue
-                    
                 result = find_context(model)
                 if result:
                     return result

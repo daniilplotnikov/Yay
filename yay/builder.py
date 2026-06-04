@@ -1,34 +1,12 @@
+import os
+from rich.console import Console
 from .agent import Agent
 from .provider import NonSelectedProvider
-from .providers import OpenAICompatibleProvider
 from .workspace import Context, load_workspace
-from .config import load_config, save_config
-from .tools.mcp import MCPClient
-from .tools import (
-    ShellTool,
-    FinishTaskTool,
-    CreateFileTool,
-    RemoveFileTool,
-    SearchTool,
-    PatchFileTool,
-    ListFilesTool,
-    ReadFileTool,
-    ReadFilesTool,
-    PDFTool,
-    GetFileInfoTool,
-    GrepTool,
-    GlobTool,
-    ThinkTool,
-    PlanTool,
-    CreateDirectoryTool,
-    TreeTool,
-    WebSearchTool,
-    WebVisitTool,
-    QuestionTool
-)
-
-from rich.console import Console
-import os
+from .sysprompt import SystemPromptBuilder
+from .config import load_config
+from .mcp import MCPClient
+from .managers import ToolsManager, ProviderManager
 
 console = Console()
 
@@ -47,97 +25,75 @@ def get_provider_api_key(cfg, provider_name):
 
     return (
         cfg.get("api_key")
-        or os.getenv("API_KEY", "dummy")
+        or os.getenv("API_KEY", "")
     )
 
 
-def build_agent():
-    tools = [
-        ShellTool(),
-        FinishTaskTool(),
-        CreateFileTool(),
-        RemoveFileTool(),
-        SearchTool(),
-        PatchFileTool(),
-        ListFilesTool(),
-        ReadFileTool(),
-        ReadFilesTool(),
-        PDFTool(),
-        GetFileInfoTool(),
-        GrepTool(),
-        GlobTool(),
-        ThinkTool(),
-        PlanTool(),
-        QuestionTool(),
-        CreateDirectoryTool(),
-        TreeTool(),
-        WebSearchTool(),
-        WebVisitTool()
-    ]
+def build_agent(tools_manager: ToolsManager, providers_manager: ProviderManager):
 
     cfg = load_config()
 
-    provider_name = cfg.get("provider")
-
-    for server_url in cfg.get("mcp_servers", []):
+    for server_url in cfg.get(
+        "mcp_servers",
+        [],
+    ):
         try:
             client = MCPClient(server_url)
-
             mcp_tools = client.fetch_tools()
+            tools_manager.register_many(mcp_tools)
+        except Exception as e:
+            continue
 
-            tools.extend(mcp_tools)
+    provider_name = (
+        cfg.get("provider")
+        or ""
+    ).lower()
 
-            console.print(
-                f"[green]Loaded {len(mcp_tools)} MCP tools from {server_url}[/green]"
+    provider = NonSelectedProvider()
+
+    provider_cls = next(
+        (
+            cls
+            for cls in providers_manager.get_providers().values()
+            if getattr(
+                cls,
+                "name",
+                "",
+            ).lower()
+            == provider_name
+        ),
+        None,
+    )
+
+    if provider_cls:
+        try:
+            provider = provider_cls(
+                api_key=get_provider_api_key(
+                    cfg,
+                    provider_name,
+                ),
+                model=cfg.get(
+                    "model",
+                    "",
+                ),
+                base_url=cfg.get(
+                    "base_url",
+                    getattr(
+                        provider_cls,
+                        "default_base_url",
+                        "",
+                    ),
+                ),
+                tools_manager=tools_manager,
             )
 
         except Exception as e:
-            console.print(
-                f"[red]Failed to load MCP server {server_url}: {e}[/red]"
-            )
-
-    if not provider_name:
-        provider = NonSelectedProvider()
-
-    elif provider_name == "openrouter":
-        api_key = get_provider_api_key(cfg, "openrouter")
-        if not api_key:
-            provider = NonSelectedProvider()
-        else:
-            provider = OpenAICompatibleProvider(
-                api_key=api_key,
-                model=cfg.get("model", ""),
-                base_url="https://openrouter.ai/api/v1",
-                tools=tools,
-            )
-
-    elif provider_name == "openai":
-        api_key = get_provider_api_key(cfg, "openai")
-        if not api_key:
-            provider = NonSelectedProvider()
-        else:
-            provider = OpenAICompatibleProvider(
-                api_key=api_key,
-                model=cfg.get("model", ""),
-                base_url="https://api.openai.com/v1",
-                tools=tools,
-            )
-
-    else:
-        api_key = get_provider_api_key(cfg, provider_name)
-        if not api_key or not cfg.get("base_url"):
-            provider = NonSelectedProvider()
-        else:
-            provider = OpenAICompatibleProvider(
-                api_key=api_key,
-                model=cfg.get("model", ""),
-                base_url=cfg.get("base_url"),
-                tools=tools,
+            provider = (
+                NonSelectedProvider()
             )
 
     try:
         models = provider.get_models()
-
         if (
             isinstance(models, list)
             and models
@@ -152,9 +108,12 @@ def build_agent():
 
     agent = Agent(
         provider=provider,
-        context=Context(provider=provider),
-        tools=tools,
-        approve_mode="safe",
+        context=Context(
+            provider=provider,
+            system_prompt=SystemPromptBuilder().build()
+        ),
+        tools_manager=tools_manager,
+        approve_mode="safe"
     )
 
     load_workspace(agent)

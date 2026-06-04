@@ -1,5 +1,5 @@
 import requests
-from ..tool import Tool
+from .tool import Tool
 
 class MCPToolAdapter(Tool):
     def __init__(self, name, description, arguments, is_safe=True):

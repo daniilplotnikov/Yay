@@ -1,11 +1,18 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional
 
 SYSTEM_SUMMARY_MARKER = "[COMPRESSED_CONTEXT]"
 
 
 class Content:
-    def __init__(self, text=""):
+    def __init__(self, text: str = "") -> None:
         self.text = text
+
+    def __repr__(self) -> str:  # handy for debugging
+        preview = self.text[:60].replace("\n", "\\n")
+        return f"Content({preview!r}{'…' if len(self.text) > 60 else ''})"
 
 
 class Message:
@@ -13,11 +20,11 @@ class Message:
         self,
         content: Content,
         role: str,
-        tool=None,
-        tool_call_id=None,
-        tool_calls=None,
-        time=None,
-    ):
+        tool: Any = None,
+        tool_call_id: Optional[str] = None,
+        tool_calls: Optional[List] = None,
+        time: Optional[datetime] = None,
+    ) -> None:
         self.content = content
         self.role = role
         self.tool = tool
@@ -25,62 +32,45 @@ class Message:
         self.tool_calls = tool_calls or []
         self.time = time or datetime.now(timezone.utc)
 
+    def __repr__(self) -> str:
+        return f"Message(role={self.role!r}, tool={bool(self.tool)})"
+
 
 class Context:
     def __init__(
         self,
-        provider,
+        provider: Any,
         compress_threshold: float = 0.8,
-        compression_callback=None,
-    ):
+        compression_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> None:
         self.provider = provider
-        self.messages: list[Message] = []
+        self.messages: List[Message] = []
         self.compress_threshold = compress_threshold
         self.compression_callback = compression_callback
-        self._system_prompt: str | None = None
+        self._system_prompt: Optional[str] = None
 
-    
+        if system_prompt:
+            self.set_system_prompt(system_prompt)
 
     def set_system_prompt(self, text: str) -> None:
-        """
-        Set (or replace) the system prompt.
-
-        The system message is always kept as the very first message.
-        Calling this method is idempotent — repeated calls update the text.
-        """
         self._system_prompt = text
         system_msg = Message(role="system", content=Content(text=text))
-
         if self.messages and self.messages[0].role == "system":
             self.messages[0] = system_msg
         else:
             self.messages.insert(0, system_msg)
 
-    
-
     def append(self, message: Message) -> None:
-        """
-        Append a message.  System messages coming from outside (e.g. compressed
-        context summaries) are handled specially so they do not displace the
-        original system prompt.
-        """
-        
-        
         if (
             message.role == "system"
             and getattr(message.content, "text", "").startswith(SYSTEM_SUMMARY_MARKER)
         ):
             self._insert_summary(message)
             return
-
         self.messages.append(message)
 
     def _insert_summary(self, summary_msg: Message) -> None:
-        """
-        Insert a compressed-context summary right after the real system prompt
-        (position 1), replacing any previous summary.
-        """
-        
         self.messages = [
             m for m in self.messages
             if not (
@@ -88,53 +78,54 @@ class Context:
                 and getattr(m.content, "text", "").startswith(SYSTEM_SUMMARY_MARKER)
             )
         ]
+
         insert_at = 1 if (self.messages and self.messages[0].role == "system") else 0
         self.messages.insert(insert_at, summary_msg)
-
-    
 
     def estimate_tokens(self) -> int:
         total = 0
         for msg in self.messages:
-            text = getattr(getattr(msg, "content", None), "text", "")
+            text = getattr(getattr(msg, "content", None), "text", "") or ""
             total += len(text) // 4
         return total
 
     @property
     def max_tokens(self) -> int:
-        return getattr(self.provider, "context_length", 0)
+        for attr in ("context_length", "max_tokens", "_context_length", "ctx_length"):
+            val = getattr(self.provider, attr, None)
+            if val:
+                try:
+                    n = int(val)
+                    if n > 0:
+                        return n
+                except (TypeError, ValueError):
+                    pass
+        return 0
 
     def usage_percent(self) -> float:
-        max_tokens = self.max_tokens
-        if max_tokens <= 0:
+        max_t = self.max_tokens
+        if max_t <= 0:
             return 0.0
-        return (self.estimate_tokens() / max_tokens) * 100.0
+        return (self.estimate_tokens() / max_t) * 100.0
 
     def needs_compression(self) -> bool:
         return self.usage_percent() >= self.compress_threshold * 100
 
-    
-
     def compress(self) -> bool:
-        """
-        Summarise the conversation and replace the bulk of messages with the
-        summary, keeping the system prompt and the last 10 messages intact.
-        """
-        
-        to_summarise = [
-            m for m in self.messages
-            if m.role != "system"
-        ]
+
+        non_system = [m for m in self.messages if m.role != "system"]
+
+        if len(non_system) <= 10:
+            return False
+
+        to_summarise = non_system[:-10]
+        recent = non_system[-10:]
 
         before_tokens = self.estimate_tokens()
 
         summary_text = self.provider.summarize(to_summarise)
 
-        
-        recent = [m for m in self.messages if m.role != "system"][-10:]
-
-        
-        new_messages: list[Message] = []
+        new_messages: List[Message] = []
 
         if self._system_prompt:
             new_messages.append(

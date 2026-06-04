@@ -19,105 +19,58 @@ from rich.table import Table
 from rich.markdown import Markdown
 from .agent import Agent
 from .llm import Context
-from .providers.openai_compatible import OpenAICompatibleProvider
 from .renderer import Renderer, C, _icon, _token_color
 from .config import load_config, save_config
 from .workspace import save_workspace
+from .managers import ProviderManager, ToolsManager
 from pathlib import Path
 
 BAR_WIDTH = 20
 
-PROVIDER_DEFS: dict[str, dict] = {
-    "openai": {
-        "label":    "OpenAI",
-        "base_url": "https://api.openai.com/v1",
-        "env_key":  "OPENAI_API_KEY",
-        "cfg_key":  "openai_api_key",
-        "fields": [
-            {"id": "api_key",  "label": "API Key",   "password": True,  "cfg": "openai_api_key"},
-            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
-        ],
-    },
-    "openrouter": {
-        "label":    "OpenRouter",
-        "base_url": "https://openrouter.ai/api/v1",
-        "env_key":  "OPENROUTER_API_KEY",
-        "cfg_key":  "openrouter_api_key",
-        "fields": [
-            {"id": "api_key",  "label": "API Key",   "password": True,  "cfg": "openrouter_api_key"},
-            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
-        ],
-    },
-    "openai_compatible": {
-        "label":    "OpenAI-Compatible",
-        "base_url": "http://localhost:1234/v1/",
-        "env_key":  "API_KEY",
-        "cfg_key":  "api_key",
-        "fields": [
-            {"id": "base_url", "label": "Base URL",  "password": False, "cfg": "base_url"},
-            {"id": "api_key",  "label": "API Key",   "password": True,  "cfg": "api_key"},
-            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
-        ],
-    },
-    "ollama": {
-        "label":    "Ollama",
-        "base_url": "http://localhost:11434/v1/",
-        "env_key":  "",
-        "cfg_key":  "",
-        "fields": [
-            {"id": "base_url", "label": "Base URL",  "password": False, "cfg": "base_url"},
-            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
-        ],
-    },
-    "lmstudio": {
-        "label":    "LM Studio",
-        "base_url": "http://localhost:1234/v1/",
-        "env_key":  "",
-        "cfg_key":  "",
-        "fields": [
-            {"id": "base_url", "label": "Base URL",  "password": False, "cfg": "base_url"},
-            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
-        ],
-    },
-}
 
-def _build_provider(name: str, cfg: dict, tools: list, current_model: str) -> OpenAICompatibleProvider:
-    pdef = PROVIDER_DEFS.get(name, PROVIDER_DEFS["openai_compatible"])
-    base_url = cfg.get("base_url", pdef["base_url"])
-    api_key  = (
-        cfg.get(pdef["cfg_key"])
-        or (os.getenv(pdef["env_key"], "") if pdef["env_key"] else "")
-        or cfg.get("api_key", "dummy")
-        or "dummy"
-    )
-    model = cfg.get("model", current_model) or current_model
-    return OpenAICompatibleProvider(
-        api_key=api_key,
-        model=model,
-        base_url=base_url,
-        tools=tools,
-    )
+def _build_provider_from_providers_manager(
+    providers_manager: ProviderManager,
+    tools_manager: ToolsManager,
+    name: str,
+    cfg: dict,
+    tools: list,
+    current_model: str,
+) -> Any:
+    """Instantiate a provider class obtained from ProviderManager."""
+    cls = providers_manager.get_provider(name)
+    if cls is None:
+        raise ValueError(f"Provider '{name}' not found in ProviderManager")
 
+    import inspect
+    sig = inspect.signature(cls.__init__)
+    params = set(sig.parameters.keys()) - {"self"}
 
+    kwargs: dict[str, Any] = {}
+    if "api_key" in params:
+        kwargs["api_key"] = cfg.get("api_key", cfg.get("openai_api_key", "dummy")) or "dummy"
+    if "model" in params:
+        kwargs["model"] = cfg.get("model", current_model) or current_model
+    if "tools_manager" in params:
+        kwargs["tools_manager"] = tools_manager
+    if "base_url" in params:
+        base_url = cfg.get("base_url")
+        if base_url:
+            kwargs["base_url"] = base_url
+    if "tools" in params:
+        kwargs["tools"] = tools
+
+    for key, val in cfg.items():
+        if key in params and key not in kwargs and val:
+            kwargs[key] = val
+
+    return cls(**kwargs)
 
 
 def _context_bar(usage: float) -> str:
-    """
-    Render a gradient-style context bar.
-    Segments: green → yellow → red based on fill level.
-    """
-    usage  = max(0.0, min(100.0, usage))
+    usage = max(0.0, min(100.0, usage))
     filled = round(BAR_WIDTH * usage / 100)
-    empty  = BAR_WIDTH - filled
+    empty = BAR_WIDTH - filled
 
-    if usage < 50:
-        bar_color = "green"
-    elif usage < 80:
-        bar_color = "yellow"
-    else:
-        bar_color = "red"
-
-    
     segments: list[str] = []
     remaining = filled
     bands = [
@@ -182,9 +135,6 @@ class CommandSuggester(Suggester):
                 return "/steer clear"
         return None
 
-
-
-
 class StatusBar(Static):
     DEFAULT_CSS = """
     StatusBar {
@@ -209,23 +159,30 @@ class StatusBar(Static):
         bar     = _context_bar(usage)
         pause   = " [yellow]⏸[/]" if paused else ""
         pcolor  = "bright_cyan" if provider_name != "?" else "grey50"
+
+        # BUG FIX: when max_tokens is 0 (provider attribute not found) show a
+        # friendlier "N/A" instead of "X/0" which looks broken.
+        if max_tokens > 0:
+            token_str = f"[bright_black]{tokens:,}/{max_tokens:,}[/]"
+            usage_str = f"[bright_black]{usage:.0f}%[/]"
+        else:
+            token_str = f"[bright_black]{tokens:,}[/]"
+            usage_str = "[bright_black]?%[/]"
+
         self.update(
             f"[{pcolor}]{provider_name}[/]"
             f"  [cyan]{model}[/]"
             f"{pause}"
             f"  [bold]{project}[/]"
             f"  {bar}"
-            f" [bright_black]{usage:.0f}%[/]"
-            f"  [bright_black]{tokens:,}/{max_tokens:,}[/]"
+            f" {usage_str}"
+            f"  {token_str}"
         )
-
-
-
 
 class ProviderPickerModal(ModalScreen):
     """
-    Step 1: choose provider type.
-    Step 2: fill in provider-specific fields.
+    Step 1: choose provider type from ProviderManager.
+    Step 2: fill in provider-specific fields (introspected from constructor).
     Returns (provider_name, updated_cfg) or None.
     """
 
@@ -254,40 +211,72 @@ class ProviderPickerModal(ModalScreen):
     #step2        { display: none; }
     """
 
-    def __init__(self, agent: "Agent") -> None:
+    _FIELD_HINTS: dict[str, dict] = {
+        "api_key":            {"label": "API Key",    "password": True},
+        "openai_api_key":     {"label": "API Key",    "password": True},
+        "openrouter_api_key": {"label": "API Key",    "password": True},
+        "base_url":           {"label": "Base URL",   "password": False},
+        "model":              {"label": "Model",      "password": False},
+        "context_length":     {"label": "Ctx Length", "password": False},
+    }
+
+    def __init__(self, agent: "Agent", manager: ProviderManager) -> None:
         super().__init__()
-        self.agent          = agent
-        self._cfg           = load_config()
-        self._chosen_name   = ""
+        self.agent             = agent
+        self.providers_manager = manager
+        self._cfg              = load_config()
+        self._chosen_name      = ""
+
+    def _provider_fields(self, name: str) -> list[dict]:
+        import inspect
+        cls = self.providers_manager.get_provider(name)
+        if cls is None:
+            return []
+        sig = inspect.signature(cls.__init__)
+        fields = []
+        skip = {"self", "tools", "kwargs", "args"}
+        for param_name, param in sig.parameters.items():
+            if param_name in skip:
+                continue
+            if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+                continue
+            hint = self._FIELD_HINTS.get(param_name, {})
+            fields.append({
+                "id":       param_name,
+                "label":    hint.get("label", param_name.replace("_", " ").title()),
+                "password": hint.get("password", False),
+                "default":  (
+                    "" if param.default is inspect.Parameter.empty
+                    else ("" if param.default is None else str(param.default))
+                ),
+            })
+        return fields
 
     def compose(self) -> ComposeResult:
+        providers = self.providers_manager.get_providers()
         with Vertical():
             yield Label("⬡  Select Provider", classes="modal-title")
             yield Label("Choose a provider to connect to", classes="subtitle")
 
-            
             with Vertical(id="step1"):
-                rows: list[list[str]] = [
-                    ["openai",            "openrouter"],
-                    ["openai_compatible", "ollama"],
-                    ["lmstudio"],
-                ]
-                for row in rows:
+                names = list(providers.keys())
+                for i in range(0, len(names), 2):
+                    row_names = names[i:i + 2]
                     with Horizontal(classes="btn-grid"):
-                        for name in row:
-                            label = PROVIDER_DEFS[name]["label"]
-                            yield Button(label, id=f"pick-{name}", classes="provider-btn")
+                        for n in row_names:
+                            cls   = providers[n]
+                            label = getattr(cls, "provider_name", n)
+                            yield Button(label, id=f"pick-{n}", classes="provider-btn")
                 yield Button("Cancel", variant="default", id="btn-cancel-step1")
 
-            
             with Vertical(id="step2"):
                 yield Label("", id="step2-title", classes="step2-title")
                 yield Vertical(id="fields-container")
                 with Horizontal(classes="btn-row"):
-                    yield Button("Back", variant="default", id="btn-back")
+                    yield Button("Back",    variant="default", id="btn-back")
                     yield Button("Connect", variant="success", id="btn-connect")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:  
+    def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
 
         if bid == "btn-cancel-step1":
@@ -295,9 +284,8 @@ class ProviderPickerModal(ModalScreen):
             return
 
         if bid.startswith("pick-"):
-            name = bid[len("pick-"):]
-            self._chosen_name = name
-            self._show_step2(name)
+            self._chosen_name = bid[len("pick-"):]
+            self._show_step2(self._chosen_name)
             return
 
         if bid == "btn-back":
@@ -310,86 +298,57 @@ class ProviderPickerModal(ModalScreen):
             return
 
     def _show_step2(self, name: str) -> None:
-        pdef = PROVIDER_DEFS[name]
+        cls   = self.providers_manager.get_provider(name)
+        label = getattr(cls, "provider_name", name) if cls else name
 
-        
-        self.query_one("#step2-title", Label).update(
-            f"Configure  {pdef['label']}"
-        )
+        self.query_one("#step2-title", Label).update(f"Configure  {label}")
 
-        
         container = self.query_one("#fields-container", Vertical)
         container.remove_children()
 
-        for field in pdef["fields"]:
+        for field in self._provider_fields(name):
             fid      = field["id"]
             flabel   = field["label"]
-            password = field.get("password", False)
-            cfg_key  = field.get("cfg", fid)
+            password = field["password"]
 
-            
-            if fid == "base_url":
-                default = self._cfg.get("base_url", pdef["base_url"])
-            elif fid == "model":
-                default = self._cfg.get("model", self.agent.provider.model)
-            elif fid == "api_key":
-                env_key  = pdef.get("env_key", "")
-                cfg_key2 = pdef.get("cfg_key", "api_key")
-                default  = (
-                    self._cfg.get(cfg_key2)
-                    or self._cfg.get("api_key", "")
-                    or (os.getenv(env_key, "") if env_key else "")
-                )
-            else:
-                default = self._cfg.get(cfg_key, "")
+            default = (
+                self._cfg.get(fid)
+                or os.getenv(fid.upper(), "")
+                or field["default"]
+            )
+            if fid == "model":
+                default = self._cfg.get("model", self.agent.provider.model) or field["default"]
 
             row = Horizontal(classes="field-row")
             row.compose_add_child(Label(f"{flabel}:", classes="field-label"))
-            inp = Input(
-                value=str(default or ""),
+            row.compose_add_child(Input(
+                value=str(default),
                 password=password,
                 id=f"field-{fid}",
                 classes="field-input",
-            )
-            row.compose_add_child(inp)
+            ))
             container.mount(row)
 
         self.query_one("#step1").styles.display = "none"
         self.query_one("#step2").styles.display = "block"
 
     def _do_connect(self) -> None:
-        name = self._chosen_name
-        pdef = PROVIDER_DEFS.get(name, PROVIDER_DEFS["openai_compatible"])
-        cfg  = load_config()
+        name   = self._chosen_name
+        fields = self._provider_fields(name)
+        cfg    = load_config()
 
-        collected: dict[str, str] = {}
-        for field in pdef["fields"]:
-            fid     = field["id"]
-            cfg_key = field.get("cfg", fid)
+        for field in fields:
+            fid = field["id"]
             try:
                 val = self.query_one(f"#field-{fid}", Input).value.strip()
             except Exception:
                 val = ""
-            collected[fid] = val
-            if val and cfg_key:
-                cfg[cfg_key] = val
-
-        
-        if "base_url" in collected and collected["base_url"]:
-            cfg["base_url"] = collected["base_url"]
-        if "model" in collected and collected["model"]:
-            cfg["model"] = collected["model"]
-        if "api_key" in collected and collected["api_key"]:
-            cfg["api_key"] = collected["api_key"]
-            cfg[pdef.get("cfg_key", "api_key")] = collected["api_key"]
+            if val:
+                cfg[fid] = val
 
         cfg["provider"] = name
         save_config(cfg)
-
         self.dismiss((name, cfg))
-
-
-
 
 class SettingsModal(ModalScreen):
     CSS = """
@@ -411,13 +370,41 @@ class SettingsModal(ModalScreen):
     .btn-row     { layout: horizontal; height: 3; align: right middle; margin-top: 1; }
     """
 
-    def __init__(self, agent: Agent) -> None:
+    def __init__(self, agent: Agent, manager: ProviderManager) -> None:
         super().__init__()
-        self.agent = agent
-        self._cfg  = load_config()
+        self.agent             = agent
+        self.providers_manager = manager
+        self._cfg              = load_config()
+
+    def _provider_fields(self, name: str) -> list[dict]:
+        import inspect
+        _HINTS = ProviderPickerModal._FIELD_HINTS
+        cls = self.providers_manager.get_provider(name)
+        if cls is None:
+            return []
+        sig = inspect.signature(cls.__init__)
+        fields = []
+        skip = {"self", "tools", "kwargs", "args"}
+        for param_name, param in sig.parameters.items():
+            if param_name in skip:
+                continue
+            if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+                continue
+            hint = _HINTS.get(param_name, {})
+            fields.append({
+                "id":       param_name,
+                "label":    hint.get("label", param_name.replace("_", " ").title()),
+                "password": hint.get("password", False),
+                "default":  (
+                    "" if param.default is inspect.Parameter.empty
+                    else ("" if param.default is None else str(param.default))
+                ),
+            })
+        return fields
 
     def compose(self) -> ComposeResult:
-        p = self.agent.provider
+        p     = self.agent.provider
+        pname = self._cfg.get("provider", "?")
         with Vertical():
             yield Label("⚙  Settings", classes="modal-title")
             with TabbedContent():
@@ -427,7 +414,7 @@ class SettingsModal(ModalScreen):
                         yield Select(
                             [
                                 ("safe (default)", "safe"),
-                                ("never",              "never"),
+                                ("never",          "never"),
                                 ("always",         "always"),
                             ],
                             value=self.agent.approve_mode,
@@ -441,52 +428,52 @@ class SettingsModal(ModalScreen):
                             classes="field-input",
                         )
                 with TabPane("Provider"):
-                    
-                    pname = self._cfg.get("provider", "openai_compatible")
-                    pdef  = PROVIDER_DEFS.get(pname, PROVIDER_DEFS["openai_compatible"])
-                    yield Label(f"Provider:  {pdef['label']}", classes="field-label")
+                    cls   = self.providers_manager.get_provider(pname)
+                    label = getattr(cls, "provider_name", pname) if cls else pname
+                    yield Label(f"Provider:  {label}", classes="field-label")
                     yield Static("")
-                    for field in pdef["fields"]:
+                    for field in self._provider_fields(pname):
                         fid      = field["id"]
                         flabel   = field["label"]
-                        password = field.get("password", False)
-                        cfg_key  = field.get("cfg", fid)
-
-                        if fid == "base_url":
-                            default = self._cfg.get("base_url", pdef["base_url"])
-                        elif fid == "model":
-                            default = self._cfg.get("model", p.model)
-                        elif fid == "api_key":
-                            env_key  = pdef.get("env_key", "")
-                            cfg_key2 = pdef.get("cfg_key", "api_key")
-                            default  = (
-                                self._cfg.get(cfg_key2)
-                                or self._cfg.get("api_key", "")
-                                or (os.getenv(env_key, "") if env_key else "")
-                            )
-                        else:
-                            default = self._cfg.get(cfg_key, "")
-
+                        password = field["password"]
+                        default  = (
+                            self._cfg.get(fid)
+                            or os.getenv(fid.upper(), "")
+                            or field["default"]
+                        )
+                        if fid == "model":
+                            default = self._cfg.get("model", p.model) or field["default"]
                         with Horizontal(classes="field-row"):
                             yield Label(f"{flabel}:", classes="field-label")
                             yield Input(
-                                value=str(default or ""),
+                                value=str(default),
                                 password=password,
                                 id=f"prov-field-{fid}",
                                 classes="field-input",
                             )
                 with TabPane("About"):
-                    pname = self._cfg.get("provider", "?")
+                    all_providers = self.providers_manager.get_all_providers()
+                    enabled       = self.providers_manager.get_providers()
+                    # BUG FIX: show "N/A" when max_tokens is 0 so the About
+                    # tab does not display a confusing "0" context length.
+                    ctx_display = (
+                        f"{self.agent.context.max_tokens:,}"
+                        if self.agent.context.max_tokens > 0
+                        else "N/A"
+                    )
                     yield Static(
                         f"[bold cyan]Model:[/bold cyan]     {p.model}\n"
                         f"[bold cyan]Provider:[/bold cyan]  {pname}  ({p.__class__.__name__})\n"
+                        f"[bold cyan]Loaded:[/bold cyan]    {len(all_providers)} providers "
+                        f"({len(enabled)} enabled)\n"
                         f"[bold cyan]Tools:[/bold cyan]     {len(self.agent.tools)}\n"
                         f"[bold cyan]Messages:[/bold cyan]  {len(self.agent.context.messages)}\n"
+                        f"[bold cyan]Ctx len:[/bold cyan]   {ctx_display}\n"
                         f"[bold cyan]CWD:[/bold cyan]       {os.getcwd()}",
                         markup=True,
                     )
             with Horizontal(classes="btn-row"):
-                yield Button("Save", variant="success", id="btn-save")
+                yield Button("Save",   variant="success", id="btn-save")
                 yield Button("Cancel", variant="default", id="btn-cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -494,11 +481,9 @@ class SettingsModal(ModalScreen):
             self.dismiss(None)
             return
 
-        cfg = load_config()
-        pname = cfg.get("provider", "openai_compatible")
-        pdef  = PROVIDER_DEFS.get(pname, PROVIDER_DEFS["openai_compatible"])
+        cfg   = load_config()
+        pname = cfg.get("provider", "?")
 
-        
         try:
             v = self.query_one("#sel-approve", Select).value
             if v and v != Select.BLANK:
@@ -506,31 +491,30 @@ class SettingsModal(ModalScreen):
                 cfg["approve_mode"] = v
         except Exception:
             pass
+
         try:
             n = int(self.query_one("#inp-ctx-len", Input).value)
-            self.agent.context.max_tokens = n
-            self.agent.provider.context_length = n
-            cfg["context_length"] = n
+            if n > 0:
+                self.agent.provider.context_length = n
+                cfg["context_length"] = n
         except Exception:
             pass
 
-        
-        for field in pdef["fields"]:
-            fid     = field["id"]
-            cfg_key = field.get("cfg", fid)
+        for field in self._provider_fields(pname):
+            fid = field["id"]
             try:
                 val = self.query_one(f"#prov-field-{fid}", Input).value.strip()
                 if val:
-                    cfg[cfg_key] = val
+                    cfg[fid] = val
+                    prov = self.agent.provider
                     if fid == "base_url":
-                        p = self.agent.provider
-                        if hasattr(p, "set_base_url"):
-                            p.set_base_url(val)
-                        elif hasattr(p, "base_url"):
-                            p.base_url = val
+                        if hasattr(prov, "set_base_url"):
+                            prov.set_base_url(val)
+                        elif hasattr(prov, "base_url"):
+                            prov.base_url = val
                     elif fid == "model":
                         try:
-                            self.agent.provider.set_model(val)
+                            prov.set_model(val)
                         except Exception:
                             pass
             except Exception:
@@ -539,9 +523,6 @@ class SettingsModal(ModalScreen):
         save_config(cfg)
         save_workspace(self.agent)
         self.dismiss("saved")
-
-
-
 
 class ModelPickerModal(ModalScreen):
     CSS = """
@@ -600,68 +581,50 @@ class StreamView(Static):
     }
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__("", *args, **kwargs)
-
         self._lines: list[str] = []
         self._partial: str = ""
-
         self._lock = threading.Lock()
         self._streaming = False
 
     def push_chunk(self, text: str) -> None:
         with self._lock:
             self._partial += text
-
             while "\n" in self._partial:
                 line, self._partial = self._partial.split("\n", 1)
                 self._lines.append(line)
-
             self._streaming = True
-
         self.app.call_from_thread(self._update_display)
 
-    def _update_display(self):
+    def _update_display(self) -> None:
         with self._lock:
             content = "\n".join(self._lines)
-
             if self._partial:
                 if content:
                     content += "\n"
                 content += self._partial
-
             streaming = self._streaming
-
         if streaming:
             self.styles.border = ("solid", "blue")
         else:
             self.styles.border = None
-
-        super().update(
-            Markdown(
-                content,
-                code_theme="monokai",
-            )
-        )
+        super().update(Markdown(content, code_theme="monokai"))
 
     def commit(self) -> str:
         with self._lock:
             if self._partial:
                 self._lines.append(self._partial)
                 self._partial = ""
-
             full = "\n".join(self._lines)
-
             self._lines = []
             self._streaming = False
-
         self.app.call_from_thread(self._update_display)
-
         return full
 
     def cancel(self) -> str:
         return self.commit()
-
+    
 class AgentTUI(App):
     CSS = """
     Screen { layers: base; }
@@ -703,26 +666,33 @@ class AgentTUI(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+p", "toggle_pause",      "Pause/Resume"),
-        Binding("ctrl+c", "do_interrupt",       "Interrupt"),
-        Binding("ctrl+s", "open_settings",      "Settings"),
-        Binding("ctrl+m", "open_model_picker",  "Models"),
+        Binding("ctrl+p", "toggle_pause",        "Pause/Resume"),
+        Binding("ctrl+c", "do_interrupt",         "Interrupt"),
+        Binding("ctrl+s", "open_settings",        "Settings"),
+        Binding("ctrl+m", "open_model_picker",    "Models"),
         Binding("ctrl+r", "open_provider_picker", "Provider"),
     ]
 
-    def __init__(self, agent: Agent) -> None:
+    def __init__(
+        self,
+        agent: Agent,
+        providers_manager: ProviderManager,
+        tools_manager: ToolsManager,
+    ) -> None:
         super().__init__()
-        self.agent = agent
-        self._R    = Renderer()
+        self.agent             = agent
+        self.providers_manager = providers_manager
+        self.tools_manager     = tools_manager
+        self._R                = Renderer()
 
         self._approval_needed = threading.Event()
         self._approval_done   = threading.Event()
         self._approval_tool   = ""
 
-        self._question_needed       = threading.Event()
-        self._question_done         = threading.Event()
+        self._question_needed           = threading.Event()
+        self._question_done             = threading.Event()
         self._question_suggestions: list[str] = []
-        self._question_answer_ref:  list[str] = []
+        self._question_answer_ref: list[str]  = []
 
         self._streaming = False
 
@@ -746,14 +716,18 @@ class AgentTUI(App):
 
     def _tick_status(self) -> None:
         try:
-            p    = self.agent.provider
-            cfg  = load_config()
-            pname = cfg.get("provider", p.__class__.__name__.replace("Provider", "").lower())
-            pdef  = PROVIDER_DEFS.get(pname, {})
-            plabel = pdef.get("label", pname)
+            p = self.agent.provider
+            cfg = load_config()
+            provider_name = (
+                cfg.get("provider")
+                or getattr(p, "provider_name", None)
+                or p.__class__.__name__
+                or "?"
+            )
+
             self.query_one(StatusBar).refresh_status(
                 model         = p.model.split("/")[-1],
-                provider_name = plabel,
+                provider_name = provider_name,
                 cwd           = os.getcwd(),
                 tokens        = self.agent.context.estimate_tokens(),
                 max_tokens    = self.agent.context.max_tokens,
@@ -793,12 +767,7 @@ class AgentTUI(App):
             def _commit():
                 log = self.query_one("#log", RichLog)
                 log.write(Text(""))
-                log.write(
-                    Markdown(
-                        full_text,
-                        code_theme="monokai",
-                    )
-                )
+                log.write(Markdown(full_text, code_theme="monokai"))
                 log.write(Text(""))
             try:
                 self.call_from_thread(_commit)
@@ -815,12 +784,7 @@ class AgentTUI(App):
             def _commit():
                 log = self.query_one("#log", RichLog)
                 log.write(Text(""))
-                log.write(
-                    Markdown(
-                        partial,
-                        code_theme="monokai",
-                    )
-                )
+                log.write(Markdown(partial, code_theme="monokai"))
                 t = Text()
                 t.append("  … interrupted", style=C.WARN)
                 log.write(t)
@@ -828,8 +792,6 @@ class AgentTUI(App):
                 self.call_from_thread(_commit)
             except Exception:
                 _commit()
-
-    
 
     def _enter_question_mode(self, suggestions: list[str]) -> None:
         self._question_suggestions = suggestions
@@ -847,10 +809,7 @@ class AgentTUI(App):
         label.remove_class("question-mode")
         self.query_one("#cmd-input", Input).placeholder = "Type a task or /help…"
 
-    
-
-    def event_handler(self, event: str, data: dict) -> None:  
-
+    def event_handler(self, event: str, data: dict) -> None:
         if event == "task_started":
             self._write_many(self._R.task_started(data["prompt"]))
 
@@ -939,8 +898,6 @@ class AgentTUI(App):
             except Exception:
                 pass
 
-    
-
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         event.input.value = ""
@@ -979,46 +936,55 @@ class AgentTUI(App):
 
         self._dispatch(text)
 
-    
-
-    def _dispatch(self, text: str) -> None:  
+    def _dispatch(self, text: str) -> None:
         t = text.strip()
 
         def info(msg: str) -> None:
-            r = Text(); r.append("  "); r.append(msg, style=C.DIM); self._write(r)
+            r = Text()
+            r.append("  ")
+            r.append(msg, style=C.DIM)
+            self._write(r)
 
         def ok(msg: str) -> None:
-            r = Text(); r.append("  ✓ ", style=C.OK); r.append(msg, style=C.DIM); self._write(r)
+            r = Text()
+            r.append("  ✓ ", style=C.OK)
+            r.append(msg, style=C.DIM)
+            self._write(r)
 
         def err(msg: str) -> None:
-            r = Text(); r.append("  ✗ ", style=C.ERR); r.append(msg); self._write(r)
+            r = Text()
+            r.append("  ✗ ", style=C.ERR)
+            r.append(msg)
+            self._write(r)
 
         if t in {"/quit", "/exit"}:
             self.exit()
 
         elif t in {"/help", "?"}:
-            tbl = Table(border_style="grey30", show_header=False, padding=(0, 2),
-                        box=None, pad_edge=False)
+            tbl = Table(
+                border_style="grey30", show_header=False, padding=(0, 2),
+                box=None, pad_edge=False,
+            )
             tbl.add_column("cmd",  style="bold cyan", no_wrap=True, min_width=32)
             tbl.add_column("desc", style="grey62")
             rows = [
-                ("/help",                                    "This help"),
-                ("/tools",                                   "List tools"),
-                ("/model-picker  (Ctrl+M)",                  "Model picker"),
-                ("/provider  (Ctrl+R)",                      "Provider picker"),
-                ("/settings  (Ctrl+S)",                      "Settings modal"),
-                ("/context",                                 "Token usage"),
-                ("/history",                                 "Message history"),
-                ("/reset",                                   "Clear context"),
-                ("/approve [never|safe|always]","Approval mode"),
-                ("/baseurl [url]",                           "Show / set base URL"),
-                ("/set_context_length <n>",                  "Max tokens"),
-                ("/compress_context",                        "Compress now"),
-                ("/pause  /resume  Ctrl+P",                  "Pause / resume"),
-                ("/steer [text|clear]",                      "Steering instructions"),
-                ("/queue",                                   "Task queue"),
-                ("/clear",                                   "Clear log"),
-                ("/quit",                                    "Exit"),
+                ("/help",                        "This help"),
+                ("/tools",                       "List tools"),
+                ("/model-picker  (Ctrl+M)",       "Model picker"),
+                ("/provider  (Ctrl+R)",           "Provider picker"),
+                ("/settings  (Ctrl+S)",           "Settings modal"),
+                ("/context",                     "Token usage"),
+                ("/history",                     "Message history"),
+                ("/reset",                       "Clear context"),
+                ("/approve [never|safe|always]", "Approval mode"),
+                ("/baseurl [url]",               "Show / set base URL"),
+                ("/set_context_length <n>",      "Max tokens"),
+                ("/compress_context",            "Compress now"),
+                ("/pause  /resume  Ctrl+P",      "Pause / resume"),
+                ("/steer [text|clear]",          "Steering instructions"),
+                ("/queue",                       "Task queue"),
+                ("/clear",                       "Clear log"),
+                ("/quit",                        "Exit"),
             ]
             for cmd, desc in rows:
                 tbl.add_row(cmd, desc)
@@ -1055,9 +1021,13 @@ class AgentTUI(App):
             r.append("  Messages: ", style=C.MUTED)
             r.append(f"{len(self.agent.context.messages)}", style="white")
             r.append("   Tokens: ", style=C.MUTED)
-            r.append(f"{tok:,} / {max_t:,}", style=col)
-            r.append(f"  ({use:.0f}%)", style=col)
-            r.append(f"  {_context_bar(use)}", style="")
+            if max_t > 0:
+                r.append(f"{tok:,} / {max_t:,}", style=col)
+                r.append(f"  ({use:.0f}%)", style=col)
+                r.append(f"  {_context_bar(use)}", style="")
+            else:
+                # BUG FIX: don't show "/0" when context_length is unknown
+                r.append(f"{tok:,}  (context length unknown)", style=C.MUTED)
             self._write(r)
 
         elif t == "/history":
@@ -1072,14 +1042,16 @@ class AgentTUI(App):
                 preview = str(content)[:300].replace("\n", " ")
                 r = Text()
                 r.append(f"  {i:3}  ", style=C.MUTED)
-                r.append(f"{msg.role:<12}", style="bold cyan" if msg.role == "assistant" else "bold white")
+                r.append(
+                    f"{msg.role:<12}",
+                    style="bold cyan" if msg.role == "assistant" else "bold white",
+                )
                 r.append(preview, style=C.DIM)
                 self._write(r)
 
         elif t == "/reset":
             self.agent.context = Context(provider=self.agent.provider)
             self.agent.context.compression_callback = self.agent._on_context_compressed
-            self.agent.context.set_system_prompt(self.agent._system_prompt)
             save_workspace(self.agent)
             ok("Context cleared")
             self._tick_status()
@@ -1093,25 +1065,29 @@ class AgentTUI(App):
         elif t.startswith("/approve "):
             mode = t.split(maxsplit=1)[1].strip()
             if mode not in {"never", "safe", "always"}:
-                err("Valid: never | safe | always")
+                err("Valid modes: never | safe | always")
                 return
             self.agent.approve_mode = mode
-            cfg = load_config(); cfg["approve_mode"] = mode
-            save_config(cfg); save_workspace(self.agent)
+            cfg = load_config()
+            cfg["approve_mode"] = mode
+            save_config(cfg)
+            save_workspace(self.agent)
             ok(f"Approval → {mode}")
 
         elif t == "/baseurl":
             info(f"Base URL: {getattr(self.agent.provider, 'base_url', 'N/A')}")
 
         elif t.startswith("/baseurl "):
-            url = t.split(maxsplit=1)[1].strip()
-            p = self.agent.provider
-            if hasattr(p, "set_base_url"):
-                p.set_base_url(url)
-            elif hasattr(p, "base_url"):
-                p.base_url = url
-            cfg = load_config(); cfg["base_url"] = url
-            save_config(cfg); save_workspace(self.agent)
+            url  = t.split(maxsplit=1)[1].strip()
+            prov = self.agent.provider
+            if hasattr(prov, "set_base_url"):
+                prov.set_base_url(url)
+            elif hasattr(prov, "base_url"):
+                prov.base_url = url
+            cfg = load_config()
+            cfg["base_url"] = url
+            save_config(cfg)
+            save_workspace(self.agent)
             ok(f"Base URL → {url}")
 
         elif t.startswith("/set_context_length "):
@@ -1120,9 +1096,14 @@ class AgentTUI(App):
                 err("Usage: /set_context_length <n>")
                 return
             n = int(val)
+            if n <= 0:
+                err("Context length must be positive")
+                return
             self.agent.provider.context_length = n
-            cfg = load_config(); cfg["context_length"] = n
-            save_config(cfg); save_workspace(self.agent)
+            cfg = load_config()
+            cfg["context_length"] = n
+            save_config(cfg)
+            save_workspace(self.agent)
             ok(f"Context length → {n:,}")
             self._tick_status()
 
@@ -1132,13 +1113,17 @@ class AgentTUI(App):
 
         elif t == "/pause":
             self.agent.pause()
-            r = Text(); r.append("  ⏸ Paused", style=C.WARN)
-            self._write(r); self._tick_status()
+            r = Text()
+            r.append("  ⏸ Paused", style=C.WARN)
+            self._write(r)
+            self._tick_status()
 
         elif t == "/resume":
             self.agent.resume()
-            r = Text(); r.append("  ▶ Resumed", style=C.OK)
-            self._write(r); self._tick_status()
+            r = Text()
+            r.append("  ▶ Resumed", style=C.OK)
+            self._write(r)
+            self._tick_status()
 
         elif t == "/steer":
             instrs = getattr(self.agent.steering, "instructions", [])
@@ -1178,30 +1163,39 @@ class AgentTUI(App):
                 self._write(r)
 
         elif t.startswith("/"):
-            err(f"Unknown: {t}  (/help)")
+            err(f"Unknown command: {t}  (/help for list)")
 
         else:
             self.agent.enqueue(prompt=t, task_id=str(time.time()))
-
-    
 
     def _set_model(self, model: str) -> None:
         try:
             models = self.agent.provider.get_models()
             if isinstance(models, list) and model not in models:
-                r = Text(); r.append("  ✗ ", style=C.ERR); r.append(f"Unknown model: {model}")
-                self._write(r); return
+                r = Text()
+                r.append("  ✗ ", style=C.ERR)
+                r.append(f"Unknown model: {model}")
+                self._write(r)
+                return
         except Exception:
             pass
         try:
             self.agent.provider.set_model(model)
         except Exception as e:
-            r = Text(); r.append("  ✗ ", style=C.ERR); r.append(str(e))
-            self._write(r); return
-        cfg = load_config(); cfg["model"] = model
-        save_config(cfg); save_workspace(self.agent)
-        r = Text(); r.append("  ✓ ", style=C.OK); r.append(f"Model → {model}", style=C.DIM)
-        self._write(r); self._tick_status()
+            r = Text()
+            r.append("  ✗ ", style=C.ERR)
+            r.append(str(e))
+            self._write(r)
+            return
+        cfg = load_config()
+        cfg["model"] = model
+        save_config(cfg)
+        save_workspace(self.agent)
+        r = Text()
+        r.append("  ✓ ", style=C.OK)
+        r.append(f"Model → {model}", style=C.DIM)
+        self._write(r)
+        self._tick_status()
 
     def _apply_provider_result(self, result) -> None:
         if result is None:
@@ -1213,26 +1207,41 @@ class AgentTUI(App):
             else self.agent.tools
         )
         try:
-            new_provider = _build_provider(name, cfg, tools, self.agent.provider.model)
+            new_provider = _build_provider_from_providers_manager(
+                self.providers_manager,
+                self.tools_manager,
+                name,
+                cfg,
+                tools,
+                self.agent.provider.model,
+            )
             self.agent.provider = new_provider
+            self.agent.context.provider = new_provider
             save_workspace(self.agent)
+            cls   = self.providers_manager.get_provider(name)
+            label = getattr(cls, "provider_name", name) if cls else name
             r = Text()
             r.append("  ✓ ", style=C.OK)
-            pdef = PROVIDER_DEFS.get(name, {})
-            r.append(f"Provider → {pdef.get('label', name)}", style=C.DIM)
+            r.append(f"Provider → {label}", style=C.DIM)
             self._write(r)
             self._tick_status()
         except Exception as e:
-            r = Text(); r.append("  ✗ ", style=C.ERR); r.append(f"Provider error: {e}")
+            r = Text()
+            r.append("  ✗ ", style=C.ERR)
+            r.append(f"Provider error: {e}")
             self._write(r)
 
     def action_toggle_pause(self) -> None:
         if self.agent.is_paused:
             self.agent.resume()
-            r = Text(); r.append("  ▶ Resumed", style=C.OK); self._write(r)
+            r = Text()
+            r.append("  ▶ Resumed", style=C.OK)
+            self._write(r)
         else:
             self.agent.pause()
-            r = Text(); r.append("  ⏸ Paused", style=C.WARN); self._write(r)
+            r = Text()
+            r.append("  ⏸ Paused", style=C.WARN)
+            self._write(r)
         self._tick_status()
 
     def action_do_interrupt(self) -> None:
@@ -1241,23 +1250,34 @@ class AgentTUI(App):
     def action_open_settings(self) -> None:
         def _cb(result):
             if result == "saved":
-                r = Text(); r.append("  ✓ ", style=C.OK)
-                r.append("Settings saved", style=C.DIM); self._write(r)
+                r = Text()
+                r.append("  ✓ ", style=C.OK)
+                r.append("Settings saved", style=C.DIM)
+                self._write(r)
                 self._tick_status()
-        self.push_screen(SettingsModal(self.agent), _cb)
+        self.push_screen(SettingsModal(self.agent, self.providers_manager), _cb)
 
     def action_open_provider_picker(self) -> None:
-        self.push_screen(ProviderPickerModal(self.agent), self._apply_provider_result)
+        self.push_screen(
+            ProviderPickerModal(self.agent, self.providers_manager),
+            self._apply_provider_result,
+        )
 
     def action_open_model_picker(self) -> None:
         try:
             models = self.agent.provider.get_models()
         except Exception:
-            r = Text(); r.append("  ✗ ", style=C.ERR)
-            r.append("Could not fetch models"); self._write(r); return
+            r = Text()
+            r.append("  ✗ ", style=C.ERR)
+            r.append("Could not fetch models")
+            self._write(r)
+            return
         if not isinstance(models, list) or not models:
-            r = Text(); r.append("  ", style=""); r.append("No models available", style=C.MUTED)
-            self._write(r); return
+            r = Text()
+            r.append("  ", style="")
+            r.append("No models available", style=C.MUTED)
+            self._write(r)
+            return
         self.push_screen(
             ModelPickerModal(models, self.agent.provider.model),
             lambda m: m and self._set_model(m),
