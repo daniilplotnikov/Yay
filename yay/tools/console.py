@@ -1,6 +1,5 @@
 from ..tool import Tool
 import subprocess
-import threading
 
 class ShellTool(Tool):
     def __init__(self):
@@ -27,12 +26,12 @@ class ShellTool(Tool):
     def execute(self, args):
         action = args.get("action")
 
-        # LIST all active processes
+        
         if action == "list":
             active = [pid for pid, proc in self.processes.items() if proc.poll() is None]
             return {"active_pids": active}
 
-        # CHECK status of a process
+        
         if action == "check":
             pid = args.get("pid")
             proc = self.processes.get(pid)
@@ -46,7 +45,7 @@ class ShellTool(Tool):
                 del self.processes[pid]
                 return {"pid": pid, "status": "finished", "stdout": stdout, "stderr": stderr, "code": retcode}
 
-        # TERMINATE a process
+        
         if action == "terminate":
             pid = args.get("pid")
             proc = self.processes.get(pid)
@@ -58,14 +57,14 @@ class ShellTool(Tool):
             del self.processes[pid]
             return {"pid": pid, "status": "terminated", "stdout": stdout, "stderr": stderr, "code": retcode}
 
-        # TERMINATE ALL processes
+        
         if action == "terminate_all":
             terminated = []
             for pid in list(self.processes.keys()):
                 terminated.append(self.execute({"action": "terminate", "pid": pid}))
             return terminated
 
-        # BLOCK background process until completion
+        
         if action == "block":
             pid = args.get("pid")
             proc = self.processes.get(pid)
@@ -76,7 +75,7 @@ class ShellTool(Tool):
             del self.processes[pid]
             return {"pid": pid, "status": "finished", "stdout": stdout, "stderr": stderr, "code": retcode}
 
-        # RUN a new command
+        
         cmd = args.get("cmd")
         if not cmd:
             return {"error": "No command specified"}

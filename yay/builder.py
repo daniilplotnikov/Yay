@@ -13,6 +13,7 @@ from .tools import (
     PatchFileTool,
     ListFilesTool,
     ReadFileTool,
+    ReadFilesTool,
     PDFTool,
     GetFileInfoTool,
     GrepTool,
@@ -22,7 +23,8 @@ from .tools import (
     CreateDirectoryTool,
     TreeTool,
     WebSearchTool,
-    WebVisitTool
+    WebVisitTool,
+    QuestionTool
 )
 
 from rich.console import Console
@@ -59,12 +61,14 @@ def build_agent():
         PatchFileTool(),
         ListFilesTool(),
         ReadFileTool(),
+        ReadFilesTool(),
         PDFTool(),
         GetFileInfoTool(),
         GrepTool(),
         GlobTool(),
         ThinkTool(),
         PlanTool(),
+        QuestionTool(),
         CreateDirectoryTool(),
         TreeTool(),
         WebSearchTool(),

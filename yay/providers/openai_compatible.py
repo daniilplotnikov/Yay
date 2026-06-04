@@ -1,21 +1,52 @@
 import json
+import time
+import traceback
 from openai import OpenAI
 from ..llm import Message, Content
 from ..provider import Provider
 
 
 class OpenAICompatibleProvider(Provider):
-    def __init__(self, api_key: str, model: str, base_url: str, tools: list = None):
+
+    RETRY_COUNT = 3
+    RETRY_DELAY = 2
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str,
+        tools: list = None,
+    ):
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
         )
+
         self.model = model
         self.tools = tools or []
 
-        self.context_length = (
-            self._detect_context_size()
-        )
+        try:
+            self.context_length = self._detect_context_size()
+        except Exception:
+            self.context_length = 128000
+
+    def _request(self, **kwargs):
+        last_error = None
+
+        for attempt in range(self.RETRY_COUNT):
+            try:
+                return self.client.chat.completions.create(**kwargs)
+
+            except Exception as e:
+                last_error = e
+
+                if attempt < self.RETRY_COUNT - 1:
+                    time.sleep(
+                        self.RETRY_DELAY * (attempt + 1)
+                    )
+
+        raise last_error
 
     def _messages(self, context):
         messages = []
@@ -98,7 +129,8 @@ class OpenAICompatibleProvider(Provider):
         return base_url
 
     def process(self, context):
-        response = self.client.chat.completions.create(
+
+        response = self._request(
             model=self.model,
             messages=self._messages(context),
             tools=self._tools() if self.tools else None,
@@ -106,43 +138,55 @@ class OpenAICompatibleProvider(Provider):
         )
 
         msg = response.choices[0].message
-        content_text = getattr(msg, "content", "") or ""
 
-        tool_calls = getattr(msg, "tool_calls", None)
+        content_text = (
+            getattr(msg, "content", "")
+            or ""
+        )
+
+        tool_calls = getattr(
+            msg,
+            "tool_calls",
+            None,
+        )
+
         if tool_calls:
             calls = []
+
             for tc in tool_calls:
                 try:
-                    args_raw = getattr(getattr(tc, "function", None), "arguments", "{}") or "{}"
-                    args = json.loads(args_raw)
+                    args = json.loads(
+                        getattr(
+                            tc.function,
+                            "arguments",
+                            "{}",
+                        )
+                        or "{}"
+                    )
                 except Exception:
                     args = {}
-                calls.append({
-                    "id": getattr(tc, "id", None),
-                    "name": getattr(getattr(tc, "function", None), "name", None),
-                    "arguments": args,
-                })
-            return Message(
-                role="assistant",
-                content=Content(text=content_text),
-                tool={"calls": calls},
-            )
 
-        tool_data = getattr(msg, "tool", None)
-        if isinstance(tool_data, dict) and "name" in tool_data:
-            try:
-                args = json.loads(tool_data.get("arguments", "{}") or "{}")
-            except Exception:
-                args = {}
+                calls.append(
+                    {
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "arguments": args,
+                    }
+                )
+
             return Message(
                 role="assistant",
-                content=Content(text=content_text),
-                tool={"name": tool_data.get("name"), "arguments": args},
+                content=Content(
+                    text=content_text
+                ),
+                tool={"calls": calls},
             )
 
         return Message(
             role="assistant",
-            content=Content(text=content_text),
+            content=Content(
+                text=content_text
+            ),
             tool=None,
         )
 
@@ -186,59 +230,182 @@ class OpenAICompatibleProvider(Provider):
             or "Conversation summary unavailable."
         )
 
-    def process_stream(self, context, on_chunk=None):
+    def process_stream(
+        self,
+        context,
+        on_chunk=None,
+    ):
 
-        stream = self.client.chat.completions.create(
-            model=self.model,
-            messages=self._messages(context),
-            tools=self._tools() if self.tools else None,
-            tool_choice="auto",
-            stream=True,
-        )
+        stream = None
+
+        last_error = None
+
+        for attempt in range(self.RETRY_COUNT):
+            try:
+                stream = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=self._messages(
+                        context
+                    ),
+                    tools=self._tools()
+                    if self.tools
+                    else None,
+                    tool_choice="auto",
+                    stream=True,
+                )
+
+                break
+
+            except Exception as e:
+                last_error = e
+
+                print(
+                    f"[STREAM] attempt "
+                    f"{attempt + 1}/"
+                    f"{self.RETRY_COUNT}: {e}"
+                )
+
+                if attempt < (
+                    self.RETRY_COUNT - 1
+                ):
+                    time.sleep(
+                        self.RETRY_DELAY
+                        * (attempt + 1)
+                    )
+
+        if stream is None:
+            raise last_error
 
         content = []
         tool_calls = {}
 
-        for chunk in stream:
-            delta = chunk.choices[0].delta
+        try:
 
-            if getattr(delta, "content", None):
-                text = delta.content
-                content.append(text)
-                if on_chunk:
-                    on_chunk({"type": "text", "content": text})
+            for chunk in stream:
 
-            if getattr(delta, "tool_calls", None):
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls:
-                        tool_calls[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
-                    elif tc.id:
-                        tool_calls[idx]["id"] = tc.id  
-                    fn = getattr(tc, "function", None)
-                    if fn:
-                        if getattr(fn, "name", None):
-                            tool_calls[idx]["name"] += fn.name
-                        if getattr(fn, "arguments", None):
-                            tool_calls[idx]["arguments"] += fn.arguments
+                if not chunk.choices:
+                    continue
 
-        text = "".join(content)
+                delta = (
+                    chunk.choices[0].delta
+                )
+
+                if getattr(
+                    delta,
+                    "content",
+                    None,
+                ):
+                    text = delta.content
+
+                    content.append(text)
+
+                    if on_chunk:
+                        on_chunk(
+                            {
+                                "type": "text",
+                                "content": text,
+                            }
+                        )
+
+                if getattr(
+                    delta,
+                    "tool_calls",
+                    None,
+                ):
+                    for tc in delta.tool_calls:
+
+                        idx = tc.index
+
+                        if idx not in tool_calls:
+                            tool_calls[idx] = {
+                                "id": "",
+                                "name": "",
+                                "arguments": "",
+                            }
+
+                        if tc.id:
+                            tool_calls[idx][
+                                "id"
+                            ] = tc.id
+
+                        fn = getattr(
+                            tc,
+                            "function",
+                            None,
+                        )
+
+                        if fn:
+
+                            if getattr(
+                                fn,
+                                "name",
+                                None,
+                            ):
+                                tool_calls[idx][
+                                    "name"
+                                ] += fn.name
+
+                            if getattr(
+                                fn,
+                                "arguments",
+                                None,
+                            ):
+                                tool_calls[idx][
+                                    "arguments"
+                                ] += fn.arguments
+
+        except Exception as e:
+
+            print(
+                "[STREAM ERROR]",
+                repr(e),
+            )
+
+            traceback.print_exc()
+
+            if content:
+                return Message(
+                    role="assistant",
+                    content=Content(
+                        text="".join(
+                            content
+                        )
+                    ),
+                    tool=None,
+                )
+
+            raise
+
         calls = []
+
         for tc in tool_calls.values():
+
             try:
-                args = json.loads(tc["arguments"] or "{}")
+                args = json.loads(
+                    tc["arguments"]
+                    or "{}"
+                )
             except Exception:
                 args = {}
-            calls.append({
-                "id": tc["id"],
-                "name": tc["name"],
-                "arguments": args,
-            })
+
+            calls.append(
+                {
+                    "id": tc["id"],
+                    "name": tc["name"],
+                    "arguments": args,
+                }
+            )
 
         return Message(
             role="assistant",
-            content=Content(text=text),
-            tool={"calls": calls} if calls else None,
+            content=Content(
+                text="".join(content)
+            ),
+            tool={
+                "calls": calls
+            }
+            if calls
+            else None,
         )
     
     def _detect_context_size(self) -> int:

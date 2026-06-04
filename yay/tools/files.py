@@ -483,6 +483,69 @@ class ReadFileTool(Tool):
                 "path": path
             } 
 
+class ReadFilesTool(Tool):
+    def __init__(self):
+        super().__init__()
+
+        self.name = "ReadFiles"
+        self.description = "Read multiple files from disk"
+
+        self.arguments = {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            },
+            "required": ["paths"]
+        }
+
+    def execute(self, args):
+        results = []
+
+        for path in args["paths"]:
+
+            if not os.path.exists(path):
+                results.append({
+                    "path": path,
+                    "error": "File not found"
+                })
+                continue
+
+            if not os.path.isfile(path):
+                results.append({
+                    "path": path,
+                    "error": "Path is not a file"
+                })
+                continue
+
+            try:
+                with open(
+                    path,
+                    "r",
+                    encoding="utf-8"
+                ) as f:
+                    content = f.read()
+
+                results.append({
+                    "path": path,
+                    "content": content
+                })
+
+            except Exception as e:
+                results.append({
+                    "path": path,
+                    "error": str(e)
+                })
+
+        return {
+            "count": len(results),
+            "files": results
+        }
+    
 class GetFileInfoTool(Tool):
     def __init__(self):
         super().__init__()

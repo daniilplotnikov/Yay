@@ -1,12 +1,11 @@
-from rich.console import Console
-from rich.panel import Panel
+import sys
 
 from .builder import build_agent
 from .tui import AgentTUI
+from .shell import run_shell
 
-console = Console()
 
-def main():
+def run_tui():
     agent = build_agent()
 
     agent.start_queue()
@@ -15,21 +14,14 @@ def main():
 
     agent.event_callback = tui.event_handler
 
-    console.print(
-        Panel.fit(
-            """
-██     ██        ██        ██     ██
-██     ██       ████       ██     ██
- ██   ██       ██  ██       ██   ██
-  ██ ██       ████████       ██ ██
-   ███       ██      ██       ███
-   ███       ██      ██       ███
-   ███      ██        ██      ███
-
-        Yet Another Yielder
-            """.strip(),
-            border_style="blue",
-        )
-    )
-
     tui.run()
+
+
+def main():
+    has_args = len(sys.argv) > 1
+    has_pipe = not sys.stdin.isatty()
+
+    if has_args or has_pipe:
+        return run_shell()
+
+    return run_tui()

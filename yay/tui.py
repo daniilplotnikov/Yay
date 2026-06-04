@@ -1,13 +1,8 @@
-"""
-Full-screen TUI — Claude Code style rendering.
-pip install textual rich
-"""
 from __future__ import annotations
 
 import os
 import time
 import threading
-import difflib
 from typing import Any
 
 from textual.app import App, ComposeResult
@@ -20,376 +15,135 @@ from textual.widgets import (
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
 from rich.text import Text
-from rich.syntax import Syntax
 from rich.table import Table
-from rich.rule import Rule
-from rich.console import Group
-from rich.padding import Padding
-
+from rich.markdown import Markdown
 from .agent import Agent
 from .llm import Context
 from .providers.openai_compatible import OpenAICompatibleProvider
-from .provider import NonSelectedProvider
+from .renderer import Renderer, C, _icon, _token_color
 from .config import load_config, save_config
-from .workspace import load_workspace, save_workspace
-class C:
-    USER        = "bold white"
-    ASSISTANT   = "white"
-    DIM         = "dim white"
-    MUTED       = "grey50"
-    TOOL_ICON   = "bold cyan"
-    TOOL_NAME   = "cyan"
-    TOOL_ARG    = "white"
-    TOOL_META   = "grey50"
-    OK          = "green"
-    ERR         = "bold red"
-    WARN        = "yellow"
-    INFO        = "cyan"
-    MODEL       = "bold cyan"
-    CWD         = "grey62"
-    TOKENS_OK   = "green"
-    TOKENS_WARN = "yellow"
-    TOKENS_HOT  = "red"
+from .workspace import save_workspace
+from pathlib import Path
 
+BAR_WIDTH = 20
 
-def _token_color(pct: float) -> str:
-    return C.TOKENS_OK if pct < 50 else C.TOKENS_WARN if pct < 80 else C.TOKENS_HOT
-_TOOL_ICON: dict[str, str] = {
-    "CMDTool":            "⬡",
-    "BashTool":           "⬡",
-    "ReadFileTool":       "⊙",
-    "WriteFileTool":      "◎",
-    "CreateFileTool":     "◎",
-    "PatchFileTool":      "◈",
-    "RemoveFileTool":     "⊗",
-    "CreateDirectoryTool":"⊞",
-    "GrepTool":           "⊛",
-    "GlobTool":           "⊡",
-    "ListFilesTool":      "⊞",
-    "TreeTool":           "⊟",
-    "PDFTool":            "⊙",
-    "ThinkTool":          "⟳",
-    "WebSearchTool":      "⊕",
-    "default":            "◆",
+PROVIDER_DEFS: dict[str, dict] = {
+    "openai": {
+        "label":    "OpenAI",
+        "base_url": "https://api.openai.com/v1",
+        "env_key":  "OPENAI_API_KEY",
+        "cfg_key":  "openai_api_key",
+        "fields": [
+            {"id": "api_key",  "label": "API Key",   "password": True,  "cfg": "openai_api_key"},
+            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
+        ],
+    },
+    "openrouter": {
+        "label":    "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "env_key":  "OPENROUTER_API_KEY",
+        "cfg_key":  "openrouter_api_key",
+        "fields": [
+            {"id": "api_key",  "label": "API Key",   "password": True,  "cfg": "openrouter_api_key"},
+            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
+        ],
+    },
+    "openai_compatible": {
+        "label":    "OpenAI-Compatible",
+        "base_url": "http://localhost:1234/v1/",
+        "env_key":  "API_KEY",
+        "cfg_key":  "api_key",
+        "fields": [
+            {"id": "base_url", "label": "Base URL",  "password": False, "cfg": "base_url"},
+            {"id": "api_key",  "label": "API Key",   "password": True,  "cfg": "api_key"},
+            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
+        ],
+    },
+    "ollama": {
+        "label":    "Ollama",
+        "base_url": "http://localhost:11434/v1/",
+        "env_key":  "",
+        "cfg_key":  "",
+        "fields": [
+            {"id": "base_url", "label": "Base URL",  "password": False, "cfg": "base_url"},
+            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
+        ],
+    },
+    "lmstudio": {
+        "label":    "LM Studio",
+        "base_url": "http://localhost:1234/v1/",
+        "env_key":  "",
+        "cfg_key":  "",
+        "fields": [
+            {"id": "base_url", "label": "Base URL",  "password": False, "cfg": "base_url"},
+            {"id": "model",    "label": "Model",      "password": False, "cfg": "model"},
+        ],
+    },
 }
 
-_TOOL_LABEL: dict[str, str] = {
-    "CMDTool":            "Bash",
-    "BashTool":           "Bash",
-    "ReadFileTool":       "Read",
-    "WriteFileTool":      "Write",
-    "CreateFileTool":     "Write",
-    "PatchFileTool":      "Edit",
-    "RemoveFileTool":     "Delete",
-    "CreateDirectoryTool":"Mkdir",
-    "GrepTool":           "Search",
-    "GlobTool":           "Glob",
-    "ListFilesTool":      "List",
-    "TreeTool":           "Tree",
-    "PDFTool":            "PDF",
-    "ThinkTool":          "Think",
-    "WebSearchTool":      "Web",
-}
+def _build_provider(name: str, cfg: dict, tools: list, current_model: str) -> OpenAICompatibleProvider:
+    pdef = PROVIDER_DEFS.get(name, PROVIDER_DEFS["openai_compatible"])
+    base_url = cfg.get("base_url", pdef["base_url"])
+    api_key  = (
+        cfg.get(pdef["cfg_key"])
+        or (os.getenv(pdef["env_key"], "") if pdef["env_key"] else "")
+        or cfg.get("api_key", "dummy")
+        or "dummy"
+    )
+    model = cfg.get("model", current_model) or current_model
+    return OpenAICompatibleProvider(
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        tools=tools,
+    )
 
-def _icon(tool: str) -> str:
-    return _TOOL_ICON.get(tool, _TOOL_ICON["default"])
 
-def _label(tool: str) -> str:
-    return _TOOL_LABEL.get(tool, tool.replace("Tool", ""))
-class Renderer:
+
+
+def _context_bar(usage: float) -> str:
     """
-    Every method returns a list of rich renderables.
-    The TUI writes them via RichLog.write() one by one.
-    Claude Code conventions:
-      • No Panel boxes for tool calls — just indented lines
-      • Bash output uses a subtle Syntax block
-      • Diffs use Syntax("diff")
-      • Assistant text is plain, no border
-      • User prompt has a "> " prefix in bold white
+    Render a gradient-style context bar.
+    Segments: green → yellow → red based on fill level.
     """
+    usage  = max(0.0, min(100.0, usage))
+    filled = round(BAR_WIDTH * usage / 100)
+    empty  = BAR_WIDTH - filled
 
-    @staticmethod
-    def user_prompt(prompt: str) -> list:
-        t = Text()
-        t.append("\n❯ ", style="bold green")
-        t.append(prompt, style=C.USER)
-        return [t]
+    if usage < 50:
+        bar_color = "green"
+    elif usage < 80:
+        bar_color = "yellow"
+    else:
+        bar_color = "red"
 
-    @staticmethod
-    def assistant_start() -> list:
-        return [Text("")]          # blank line before response
+    
+    segments: list[str] = []
+    remaining = filled
+    bands = [
+        (int(BAR_WIDTH * 0.50), "green"),
+        (int(BAR_WIDTH * 0.30), "yellow"),
+        (BAR_WIDTH,             "red"),
+    ]
+    pos = 0
+    for band_end, color in bands:
+        band_count = min(remaining, band_end - pos)
+        if band_count > 0:
+            segments.append(f"[{color}]{'█' * band_count}[/]")
+            remaining -= band_count
+        pos = band_end
+        if remaining <= 0:
+            break
 
-    @staticmethod
-    def assistant_end() -> list:
-        return [Text("")]          # blank line after response
+    bar = "".join(segments) + f"[bright_black]{'░' * empty}[/]"
+    return bar
 
-    @staticmethod
-    def thinking() -> list:
-        t = Text()
-        t.append("  ⟳ ", style=C.MUTED)
-        t.append("Thinking…", style=C.DIM)
-        return [t]
-
-    @staticmethod
-    def tool_call(tool: str, args: dict) -> list:
-        if tool in {"ThinkTool", "FinishTaskTool"}:
-            return []
-
-        icon  = _icon(tool)
-        label = _label(tool)
-        if tool in {"CMDTool", "BashTool"}:
-            cmd = args.get("cmd", args.get("command", ""))
-            header = Text()
-            header.append(f"\n  {icon} ", style=C.TOOL_ICON)
-            header.append(label, style=C.TOOL_NAME)
-            header.append("  ", style="")
-            header.append(cmd[:120], style=C.TOOL_ARG)
-            return [header]
-        if args.get("old") is not None and args.get("new") is not None:
-            diff_lines = "\n".join(difflib.unified_diff(
-                args["old"].splitlines(), args["new"].splitlines(),
-                fromfile="old", tofile="new", lineterm="",
-            ))
-            header = Text()
-            header.append(f"\n  {icon} ", style=C.TOOL_ICON)
-            header.append(label, style=C.TOOL_NAME)
-            path = args.get("path", "")
-            if path:
-                header.append(f"  {path}", style=C.TOOL_META)
-            return [header, Syntax(diff_lines, "diff", word_wrap=True,
-                                   indent_guides=False, padding=(0, 4))]
-        path = (
-            args.get("path") or args.get("pattern") or
-            args.get("glob") or args.get("query") or ""
-        )
-        extra = ""
-        if tool == "GrepTool":
-            pat = args.get("pattern", "")
-            in_path = args.get("path", "")
-            path = f"{pat}"
-            extra = f"  in {in_path}" if in_path else ""
-        elif tool == "ReadFileTool":
-            sl = args.get("start_line")
-            el = args.get("end_line")
-            if sl:
-                extra = f"  :{sl}-{el or '…'}"
-
-        t = Text()
-        t.append(f"\n  {icon} ", style=C.TOOL_ICON)
-        t.append(label, style=C.TOOL_NAME)
-        t.append(f"  {path}", style=C.TOOL_ARG)
-        if extra:
-            t.append(extra, style=C.TOOL_META)
-        return [t]
-
-    @staticmethod
-    def tool_result(tool: str, result: Any) -> list:  # noqa: C901
-        icon  = _icon(tool)
-        label = _label(tool)
-
-        def _status(msg: str, style: str = C.MUTED) -> Text:
-            t = Text()
-            t.append(f"    ↳ ", style=C.MUTED)
-            t.append(msg, style=style)
-            return t
-        if tool == "ThinkTool":
-            if not isinstance(result, str) or not result.strip():
-                return []
-            out = [Text("")]
-            for line in result.strip().splitlines():
-                t = Text()
-                t.append("    ", style="")
-                t.append(line, style=C.DIM)
-                out.append(t)
-            return out
-        if tool in {"CMDTool", "BashTool"} and isinstance(result, dict):
-            stdout = (result.get("stdout") or "").strip()
-            stderr = (result.get("stderr") or "").strip()
-            code   = result.get("code", 0)
-            ok     = code == 0
-
-            items: list = []
-            body = "\n".join(filter(None, [stdout, stderr]))
-            if body:
-                lines = body.splitlines()
-                shown = lines[:60]
-                hidden = len(lines) - 60
-                body_text = "\n".join(shown)
-                if hidden > 0:
-                    body_text += f"\n  … {hidden} more lines"
-                items.append(Syntax(
-                    body_text, "bash",
-                    word_wrap=True,
-                    background_color="default",
-                    padding=(0, 4),
-                ))
-            status_msg = "Done" if ok else f"Exit {code}"
-            items.append(_status(status_msg, C.OK if ok else C.ERR))
-            return items
-        if tool in {"CreateFileTool", "WriteFileTool", "PatchFileTool"}:
-            if isinstance(result, dict) and "diff" in result:
-                diff_text = result["diff"]
-                return [
-                    Syntax(diff_text, "diff", word_wrap=True,
-                           background_color="default", padding=(0, 4)),
-                    _status("Written", C.OK),
-                ]
-            path = ""
-            if isinstance(result, dict):
-                path = result.get("path", "")
-            elif isinstance(result, str):
-                path = result
-            return [_status(f"Written  {path}", C.OK)]
-        if tool == "RemoveFileTool":
-            if isinstance(result, dict) and "results" in result:
-                items = []
-                for r in result["results"]:
-                    p = r.get("path", "")
-                    if r.get("status") == "deleted":
-                        items.append(_status(f"Deleted  {p}", C.ERR))
-                    elif "error" in r:
-                        items.append(_status(f"Error  {p}  {r['error']}", C.ERR))
-                return items
-            return [_status("Deleted", C.ERR)]
-        if tool == "CreateDirectoryTool":
-            path = (result or "").replace("Directory created: ", "") if isinstance(result, str) else ""
-            return [_status(f"Created  {path}", C.OK)]
-        if tool == "ReadFileTool" and isinstance(result, dict):
-            lines = len((result.get("content") or "").splitlines())
-            return [_status(f"{lines:,} lines  {result.get('path', '')}", C.MUTED)]
-        if tool == "ListFilesTool" and isinstance(result, list):
-            return [_status(f"{len(result)} files", C.MUTED)]
-        if tool == "GrepTool" and isinstance(result, dict):
-            m = result.get("matches", 0)
-            matches_text = f"{m} match{'es' if m != 1 else ''}"
-            items: list = [_status(matches_text, C.OK if m else C.MUTED)]
-            hits = result.get("lines") or result.get("results") or []
-            for hit in hits[:8]:
-                t = Text()
-                t.append("      ", style="")
-                if isinstance(hit, dict):
-                    ln  = hit.get("line_number", "")
-                    txt = hit.get("line", str(hit))
-                    t.append(f"{ln}  ", style=C.MUTED)
-                    t.append(txt.rstrip(), style=C.TOOL_ARG)
-                else:
-                    t.append(str(hit).rstrip(), style=C.TOOL_ARG)
-                items.append(t)
-            if len(hits) > 8:
-                items.append(_status(f"… {len(hits) - 8} more", C.MUTED))
-            return items
-        if tool == "GlobTool" and isinstance(result, dict):
-            c = result.get("count", 0)
-            files = result.get("files") or result.get("results") or []
-            items: list = [_status(f"{c} file{'s' if c != 1 else ''}", C.MUTED)]
-            for f in files[:6]:
-                t = Text()
-                t.append("      ", style="")
-                t.append(str(f), style=C.TOOL_ARG)
-                items.append(t)
-            if len(files) > 6:
-                items.append(_status(f"… {len(files) - 6} more", C.MUTED))
-            return items
-        if tool == "TreeTool" and isinstance(result, str):
-            items: list = []
-            for line in result.splitlines()[:40]:
-                t = Text()
-                t.append("    ", style="")
-                t.append(line, style=C.DIM)
-                items.append(t)
-            return items
-        if tool == "PDFTool" and isinstance(result, dict):
-            pages = result.get("pages", "?")
-            return [_status(f"{pages} pages  {result.get('path', '')}", C.MUTED)]
-        if result is not None:
-            s = str(result)[:800]
-            items: list = []
-            for line in s.splitlines():
-                t = Text()
-                t.append("    ", style="")
-                t.append(line, style=C.DIM)
-                items.append(t)
-            return items
-
-        return []
-
-    @staticmethod
-    def approval_request(tool: str) -> list:
-        t = Text()
-        t.append("\n  ◈ ", style=C.WARN)
-        t.append("Allow ", style=C.WARN)
-        t.append(tool, style="bold " + C.WARN)
-        t.append("?  ", style=C.WARN)
-        t.append("y", style="bold green")
-        t.append(" / ", style=C.MUTED)
-        t.append("n", style="bold red")
-        t.append(" / ", style=C.MUTED)
-        t.append("a", style="bold cyan")
-        t.append(" (always)", style=C.MUTED)
-        return [t]
-
-    @staticmethod
-    def approval_result(granted: bool, tool: str) -> list:
-        if granted:
-            t = Text()
-            t.append("    ✓ ", style=C.OK)
-            t.append("Allowed  ", style=C.MUTED)
-            t.append(tool, style=C.MUTED)
-        else:
-            t = Text()
-            t.append("    ✗ ", style=C.ERR)
-            t.append("Denied  ", style=C.MUTED)
-            t.append(tool, style=C.MUTED)
-        return [t]
-
-    @staticmethod
-    def tool_error(tool: str, error: str) -> list:
-        header = Text()
-        header.append(f"\n  {_icon(tool)} ", style=C.ERR)
-        header.append(f"{_label(tool)} failed", style=C.ERR)
-        detail = Text()
-        detail.append("    ", style="")
-        detail.append(error[:300], style=C.ERR)
-        return [header, detail]
-
-    @staticmethod
-    def task_error(error: str) -> list:
-        header = Text()
-        header.append("\n  ✗ ", style=C.ERR)
-        header.append("Error", style=C.ERR)
-        items: list = [header]
-        for line in error.strip().splitlines():
-            t = Text()
-            t.append("    ", style="")
-            t.append(line, style=C.ERR)
-            items.append(t)
-        return items
-
-    @staticmethod
-    def context_compressed(before: int, after: int) -> list:
-        t = Text()
-        t.append("  ⟳ ", style=C.WARN)
-        t.append("Context compressed  ", style=C.DIM)
-        t.append(f"{before:,}", style=C.WARN)
-        t.append(" → ", style=C.MUTED)
-        t.append(f"{after:,}", style=C.OK)
-        t.append(" tokens", style=C.MUTED)
-        return [t]
-
-    @staticmethod
-    def task_started(prompt: str) -> list:
-        t = Text()
-        t.append("\n❯ ", style="bold green")
-        t.append(prompt, style=C.USER)
-        return [t]
 class CommandSuggester(Suggester):
     COMMANDS = [
-        "/help", "/tools", "/models", "/model", "/model next",
-        "/settings", "/model-picker",
+        "/help", "/tools",
+        "/settings", "/provider",
         "/context", "/history", "/reset", "/clear", "/quit",
-        "/approve", "/approve ask_all","/approve ask_unsafe","/approve auto_approve",
-        "/provider", "/provider openai", "/provider openrouter",
-        "/provider openai_compatible", "/provider reset",
+        "/approve", "/approve never", "/approve safe", "/approve always",
         "/baseurl", "/set_context_length", "/compress_context",
         "/pause", "/resume",
         "/steer", "/steer clear",
@@ -420,17 +174,17 @@ class CommandSuggester(Suggester):
             except Exception:
                 pass
         if len(parts) == 2 and parts[0] == "/approve":
-            for mode in ("safe", "always", "never"):
+            for mode in ("never", "safe", "always"):
                 if mode.startswith(parts[1]):
                     return f"/approve {mode}"
-        if len(parts) == 2 and parts[0] == "/provider":
-            for p in ("openai", "openrouter", "openai_compatible", "reset"):
-                if p.startswith(parts[1]):
-                    return f"/provider {p}"
         if len(parts) == 2 and parts[0] == "/steer":
             if "clear".startswith(parts[1]):
                 return "/steer clear"
         return None
+
+
+
+
 class StatusBar(Static):
     DEFAULT_CSS = """
     StatusBar {
@@ -442,19 +196,206 @@ class StatusBar(Static):
     """
 
     def refresh_status(
-        self, model: str, cwd: str, tokens: int,
-        max_tokens: int, usage: float, paused: bool,
+        self,
+        model: str,
+        provider_name: str,
+        cwd: str,
+        tokens: int,
+        max_tokens: int,
+        usage: float,
+        paused: bool,
     ) -> None:
-        col = _token_color(usage)
-        pause = " [yellow][paused][/yellow]" if paused else ""
-        cwd_display = cwd if len(cwd) <= 45 else "…" + cwd[-44:]
+        project = Path(cwd).name or cwd
+        bar     = _context_bar(usage)
+        pause   = " [yellow]⏸[/]" if paused else ""
+        pcolor  = "bright_cyan" if provider_name != "?" else "grey50"
         self.update(
-            f"[{C.MODEL}]{model}[/{C.MODEL}]{pause}"
-            f"  [{C.CWD}]{cwd_display}[/{C.CWD}]"
-            f"  [{col}]{tokens:,} / {max_tokens:,}  {usage:.0f}%[/{col}]"
+            f"[{pcolor}]{provider_name}[/]"
+            f"  [cyan]{model}[/]"
+            f"{pause}"
+            f"  [bold]{project}[/]"
+            f"  {bar}"
+            f" [bright_black]{usage:.0f}%[/]"
+            f"  [bright_black]{tokens:,}/{max_tokens:,}[/]"
         )
+
+
+
+
+class ProviderPickerModal(ModalScreen):
+    """
+    Step 1: choose provider type.
+    Step 2: fill in provider-specific fields.
+    Returns (provider_name, updated_cfg) or None.
+    """
+
+    CSS = """
+    ProviderPickerModal {
+        align: center middle;
+    }
+    ProviderPickerModal > Vertical {
+        width: 68;
+        height: auto;
+        max-height: 85%;
+        background: $surface;
+        border: round $accent;
+        padding: 1 2;
+    }
+    .modal-title  { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
+    .subtitle     { text-align: center; color: $text-muted; margin-bottom: 1; }
+    .provider-btn { width: 1fr; margin: 0 1; }
+    .btn-grid     { layout: horizontal; height: 3; margin-bottom: 1; }
+    .field-row    { height: 3; layout: horizontal; align: left middle; margin-bottom: 1; }
+    .field-label  { width: 20; color: $text-muted; }
+    .field-input  { width: 1fr; border: solid $accent; }
+    .btn-row      { layout: horizontal; height: 3; align: right middle; margin-top: 1; }
+    .step2-title  { color: $accent; text-style: bold; margin-bottom: 1; }
+    #step1        { }
+    #step2        { display: none; }
+    """
+
+    def __init__(self, agent: "Agent") -> None:
+        super().__init__()
+        self.agent          = agent
+        self._cfg           = load_config()
+        self._chosen_name   = ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("⬡  Select Provider", classes="modal-title")
+            yield Label("Choose a provider to connect to", classes="subtitle")
+
+            
+            with Vertical(id="step1"):
+                rows: list[list[str]] = [
+                    ["openai",            "openrouter"],
+                    ["openai_compatible", "ollama"],
+                    ["lmstudio"],
+                ]
+                for row in rows:
+                    with Horizontal(classes="btn-grid"):
+                        for name in row:
+                            label = PROVIDER_DEFS[name]["label"]
+                            yield Button(label, id=f"pick-{name}", classes="provider-btn")
+                yield Button("Cancel", variant="default", id="btn-cancel-step1")
+
+            
+            with Vertical(id="step2"):
+                yield Label("", id="step2-title", classes="step2-title")
+                yield Vertical(id="fields-container")
+                with Horizontal(classes="btn-row"):
+                    yield Button("Back", variant="default", id="btn-back")
+                    yield Button("Connect", variant="success", id="btn-connect")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:  
+        bid = event.button.id or ""
+
+        if bid == "btn-cancel-step1":
+            self.dismiss(None)
+            return
+
+        if bid.startswith("pick-"):
+            name = bid[len("pick-"):]
+            self._chosen_name = name
+            self._show_step2(name)
+            return
+
+        if bid == "btn-back":
+            self.query_one("#step1").styles.display = "block"
+            self.query_one("#step2").styles.display = "none"
+            return
+
+        if bid == "btn-connect":
+            self._do_connect()
+            return
+
+    def _show_step2(self, name: str) -> None:
+        pdef = PROVIDER_DEFS[name]
+
+        
+        self.query_one("#step2-title", Label).update(
+            f"Configure  {pdef['label']}"
+        )
+
+        
+        container = self.query_one("#fields-container", Vertical)
+        container.remove_children()
+
+        for field in pdef["fields"]:
+            fid      = field["id"]
+            flabel   = field["label"]
+            password = field.get("password", False)
+            cfg_key  = field.get("cfg", fid)
+
+            
+            if fid == "base_url":
+                default = self._cfg.get("base_url", pdef["base_url"])
+            elif fid == "model":
+                default = self._cfg.get("model", self.agent.provider.model)
+            elif fid == "api_key":
+                env_key  = pdef.get("env_key", "")
+                cfg_key2 = pdef.get("cfg_key", "api_key")
+                default  = (
+                    self._cfg.get(cfg_key2)
+                    or self._cfg.get("api_key", "")
+                    or (os.getenv(env_key, "") if env_key else "")
+                )
+            else:
+                default = self._cfg.get(cfg_key, "")
+
+            row = Horizontal(classes="field-row")
+            row.compose_add_child(Label(f"{flabel}:", classes="field-label"))
+            inp = Input(
+                value=str(default or ""),
+                password=password,
+                id=f"field-{fid}",
+                classes="field-input",
+            )
+            row.compose_add_child(inp)
+            container.mount(row)
+
+        self.query_one("#step1").styles.display = "none"
+        self.query_one("#step2").styles.display = "block"
+
+    def _do_connect(self) -> None:
+        name = self._chosen_name
+        pdef = PROVIDER_DEFS.get(name, PROVIDER_DEFS["openai_compatible"])
+        cfg  = load_config()
+
+        collected: dict[str, str] = {}
+        for field in pdef["fields"]:
+            fid     = field["id"]
+            cfg_key = field.get("cfg", fid)
+            try:
+                val = self.query_one(f"#field-{fid}", Input).value.strip()
+            except Exception:
+                val = ""
+            collected[fid] = val
+            if val and cfg_key:
+                cfg[cfg_key] = val
+
+        
+        if "base_url" in collected and collected["base_url"]:
+            cfg["base_url"] = collected["base_url"]
+        if "model" in collected and collected["model"]:
+            cfg["model"] = collected["model"]
+        if "api_key" in collected and collected["api_key"]:
+            cfg["api_key"] = collected["api_key"]
+            cfg[pdef.get("cfg_key", "api_key")] = collected["api_key"]
+
+        cfg["provider"] = name
+        save_config(cfg)
+
+        self.dismiss((name, cfg))
+
+
+
+
 class SettingsModal(ModalScreen):
     CSS = """
+    SettingsModal {
+        align: center middle;
+    }
     SettingsModal > Vertical {
         width: 72;
         height: auto;
@@ -473,7 +414,7 @@ class SettingsModal(ModalScreen):
     def __init__(self, agent: Agent) -> None:
         super().__init__()
         self.agent = agent
-        self._cfg = load_config()
+        self._cfg  = load_config()
 
     def compose(self) -> ComposeResult:
         p = self.agent.provider
@@ -484,34 +425,61 @@ class SettingsModal(ModalScreen):
                     with Horizontal(classes="field-row"):
                         yield Label("Approval mode:", classes="field-label")
                         yield Select(
-                            [("safe", "safe"), ("always", "always"), ("never", "never")],
-                            value=self.agent.approve_mode, id="sel-approve",
+                            [
+                                ("safe (default)", "safe"),
+                                ("never",              "never"),
+                                ("always",         "always"),
+                            ],
+                            value=self.agent.approve_mode,
+                            id="sel-approve",
                         )
                     with Horizontal(classes="field-row"):
                         yield Label("Context length:", classes="field-label")
-                        yield Input(value=str(self.agent.context.max_tokens),
-                                    id="inp-ctx-len", classes="field-input")
-                with TabPane("Provider"):
-                    with Horizontal(classes="field-row"):
-                        yield Label("Provider:", classes="field-label")
-                        yield Select(
-                            [("openai","openai"),("openrouter","openrouter"),
-                             ("openai_compatible","openai_compatible")],
-                            value=self._cfg.get("provider","openai_compatible"),
-                            id="sel-provider",
+                        yield Input(
+                            value=str(self.agent.context.max_tokens),
+                            id="inp-ctx-len",
+                            classes="field-input",
                         )
-                    with Horizontal(classes="field-row"):
-                        yield Label("Base URL:", classes="field-label")
-                        yield Input(value=getattr(p,"base_url",""),
-                                    id="inp-base-url", classes="field-input")
-                    with Horizontal(classes="field-row"):
-                        yield Label("API Key:", classes="field-label")
-                        yield Input(value=self._cfg.get("api_key",""),
-                                    password=True, id="inp-api-key", classes="field-input")
+                with TabPane("Provider"):
+                    
+                    pname = self._cfg.get("provider", "openai_compatible")
+                    pdef  = PROVIDER_DEFS.get(pname, PROVIDER_DEFS["openai_compatible"])
+                    yield Label(f"Provider:  {pdef['label']}", classes="field-label")
+                    yield Static("")
+                    for field in pdef["fields"]:
+                        fid      = field["id"]
+                        flabel   = field["label"]
+                        password = field.get("password", False)
+                        cfg_key  = field.get("cfg", fid)
+
+                        if fid == "base_url":
+                            default = self._cfg.get("base_url", pdef["base_url"])
+                        elif fid == "model":
+                            default = self._cfg.get("model", p.model)
+                        elif fid == "api_key":
+                            env_key  = pdef.get("env_key", "")
+                            cfg_key2 = pdef.get("cfg_key", "api_key")
+                            default  = (
+                                self._cfg.get(cfg_key2)
+                                or self._cfg.get("api_key", "")
+                                or (os.getenv(env_key, "") if env_key else "")
+                            )
+                        else:
+                            default = self._cfg.get(cfg_key, "")
+
+                        with Horizontal(classes="field-row"):
+                            yield Label(f"{flabel}:", classes="field-label")
+                            yield Input(
+                                value=str(default or ""),
+                                password=password,
+                                id=f"prov-field-{fid}",
+                                classes="field-input",
+                            )
                 with TabPane("About"):
+                    pname = self._cfg.get("provider", "?")
                     yield Static(
                         f"[bold cyan]Model:[/bold cyan]     {p.model}\n"
-                        f"[bold cyan]Provider:[/bold cyan]  {p.__class__.__name__}\n"
+                        f"[bold cyan]Provider:[/bold cyan]  {pname}  ({p.__class__.__name__})\n"
                         f"[bold cyan]Tools:[/bold cyan]     {len(self.agent.tools)}\n"
                         f"[bold cyan]Messages:[/bold cyan]  {len(self.agent.context.messages)}\n"
                         f"[bold cyan]CWD:[/bold cyan]       {os.getcwd()}",
@@ -523,42 +491,70 @@ class SettingsModal(ModalScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-cancel":
-            self.dismiss(None); return
+            self.dismiss(None)
+            return
+
         cfg = load_config()
+        pname = cfg.get("provider", "openai_compatible")
+        pdef  = PROVIDER_DEFS.get(pname, PROVIDER_DEFS["openai_compatible"])
+
+        
         try:
             v = self.query_one("#sel-approve", Select).value
             if v and v != Select.BLANK:
-                self.agent.approve_mode = v; cfg["approve_mode"] = v
-        except Exception: pass
+                self.agent.approve_mode = v
+                cfg["approve_mode"] = v
+        except Exception:
+            pass
         try:
             n = int(self.query_one("#inp-ctx-len", Input).value)
             self.agent.context.max_tokens = n
             self.agent.provider.context_length = n
             cfg["context_length"] = n
-        except Exception: pass
-        try:
-            url = self.query_one("#inp-base-url", Input).value.strip()
-            if url:
-                p = self.agent.provider
-                if hasattr(p,"set_base_url"): p.set_base_url(url)
-                elif hasattr(p,"base_url"):   p.base_url = url
-                cfg["base_url"] = url
-        except Exception: pass
-        try:
-            key = self.query_one("#inp-api-key", Input).value.strip()
-            if key: cfg["api_key"] = key
-        except Exception: pass
-        save_config(cfg); save_workspace(self.agent)
+        except Exception:
+            pass
+
+        
+        for field in pdef["fields"]:
+            fid     = field["id"]
+            cfg_key = field.get("cfg", fid)
+            try:
+                val = self.query_one(f"#prov-field-{fid}", Input).value.strip()
+                if val:
+                    cfg[cfg_key] = val
+                    if fid == "base_url":
+                        p = self.agent.provider
+                        if hasattr(p, "set_base_url"):
+                            p.set_base_url(val)
+                        elif hasattr(p, "base_url"):
+                            p.base_url = val
+                    elif fid == "model":
+                        try:
+                            self.agent.provider.set_model(val)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        save_config(cfg)
+        save_workspace(self.agent)
         self.dismiss("saved")
+
+
+
+
 class ModelPickerModal(ModalScreen):
     CSS = """
+    ModelPickerModal {
+        align: center middle;
+    }
     ModelPickerModal > Vertical {
         width: 62; height: 80%;
         background: $surface; border: round $accent; padding: 1 2;
     }
-    .modal-title { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
-    #model-search { border: solid $accent; margin-bottom: 1; }
-    #model-list   { height: 1fr; border: solid $panel; }    
+    .modal-title   { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
+    #model-search  { border: solid $accent; margin-bottom: 1; }
+    #model-list    { height: 1fr; border: solid $panel; }
     """
 
     def __init__(self, models: list[str], current: str) -> None:
@@ -592,10 +588,8 @@ class ModelPickerModal(ModalScreen):
 
     def on_button_pressed(self, _: Button.Pressed) -> None:
         self.dismiss(None)
+
 class StreamView(Static):
-    """
-    Live streaming widget с рамкой только при стриминге.
-    """
     DEFAULT_CSS = """
     StreamView {
         height: auto;
@@ -608,45 +602,61 @@ class StreamView(Static):
 
     def __init__(self, *args, **kwargs):
         super().__init__("", *args, **kwargs)
+
         self._lines: list[str] = []
         self._partial: str = ""
+
         self._lock = threading.Lock()
         self._streaming = False
 
     def push_chunk(self, text: str) -> None:
-        """Добавление текста во время стриминга."""
         with self._lock:
             self._partial += text
+
             while "\n" in self._partial:
                 line, self._partial = self._partial.split("\n", 1)
                 self._lines.append(line)
+
             self._streaming = True
+
         self.app.call_from_thread(self._update_display)
 
     def _update_display(self):
         with self._lock:
-            t = Text()
-            if self._streaming:
-                t.append("streaming…\n", style="dim cyan")
-                self.styles.border = ("solid", "blue")  # рамка активна
-            else:
-                self.styles.border = None  # скрываем рамку
-            for line in self._lines:
-                t.append(line + "\n", style=C.ASSISTANT)
+            content = "\n".join(self._lines)
+
             if self._partial:
-                t.append(self._partial, style=C.ASSISTANT)
-        super().update(t)
+                if content:
+                    content += "\n"
+                content += self._partial
+
+            streaming = self._streaming
+
+        if streaming:
+            self.styles.border = ("solid", "blue")
+        else:
+            self.styles.border = None
+
+        super().update(
+            Markdown(
+                content,
+                code_theme="monokai",
+            )
+        )
 
     def commit(self) -> str:
-        """Завершение стрима: скрываем рамку и оставляем полный текст."""
         with self._lock:
             if self._partial:
                 self._lines.append(self._partial)
                 self._partial = ""
+
             full = "\n".join(self._lines)
+
             self._lines = []
             self._streaming = False
+
         self.app.call_from_thread(self._update_display)
+
         return full
 
     def cancel(self) -> str:
@@ -661,14 +671,13 @@ class AgentTUI(App):
         padding: 0 2;
         scrollbar-gutter: stable;
     }
-
     StreamView {
         height: auto;
         max-height: 60%;
         padding: 0 2;
         background: $background;
     }
-    #input-bar {        
+    #input-bar {
         height: 3;
         border-top: solid $accent;
         background: $surface;
@@ -677,11 +686,12 @@ class AgentTUI(App):
         align: left middle;
     }
     #prompt-label {
-            width: auto;
+        width: auto;
         color: $accent;
         padding: 0 1 0 0;
         content-align: left middle;
     }
+    #prompt-label.question-mode { color: yellow; }
     #cmd-input {
         height: 1;
         width: 1fr;
@@ -693,10 +703,11 @@ class AgentTUI(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+p", "toggle_pause",     "Pause/Resume"),
-        Binding("ctrl+c", "do_interrupt",      "Interrupt"),
-        Binding("ctrl+s", "open_settings",     "Settings"),
-        Binding("ctrl+m", "open_model_picker", "Models"),
+        Binding("ctrl+p", "toggle_pause",      "Pause/Resume"),
+        Binding("ctrl+c", "do_interrupt",       "Interrupt"),
+        Binding("ctrl+s", "open_settings",      "Settings"),
+        Binding("ctrl+m", "open_model_picker",  "Models"),
+        Binding("ctrl+r", "open_provider_picker", "Provider"),
     ]
 
     def __init__(self, agent: Agent) -> None:
@@ -708,12 +719,17 @@ class AgentTUI(App):
         self._approval_done   = threading.Event()
         self._approval_tool   = ""
 
+        self._question_needed       = threading.Event()
+        self._question_done         = threading.Event()
+        self._question_suggestions: list[str] = []
+        self._question_answer_ref:  list[str] = []
+
         self._streaming = False
 
     def compose(self) -> ComposeResult:
         yield StatusBar(id="statusbar")
         yield RichLog(id="log", highlight=False, markup=False, wrap=True)
-        yield StreamView(id="stream-view")          # live streaming area
+        yield StreamView(id="stream-view")
         with Horizontal(id="input-bar"):
             yield Label("❯", id="prompt-label")
             yield Input(
@@ -727,25 +743,22 @@ class AgentTUI(App):
         self.query_one("#cmd-input", Input).focus()
         self._tick_status()
         self.set_interval(2, self._tick_status)
-        hint = Text()
-        hint.append("  /help", style="bold cyan")
-        hint.append(" for commands  ·  ", style=C.MUTED)
-        hint.append("Ctrl+S", style="bold cyan")
-        hint.append(" settings  ·  ", style=C.MUTED)
-        hint.append("Ctrl+M", style="bold cyan")
-        hint.append(" models\n", style=C.MUTED)
-        self._write(hint)
 
     def _tick_status(self) -> None:
         try:
-            p = self.agent.provider
+            p    = self.agent.provider
+            cfg  = load_config()
+            pname = cfg.get("provider", p.__class__.__name__.replace("Provider", "").lower())
+            pdef  = PROVIDER_DEFS.get(pname, {})
+            plabel = pdef.get("label", pname)
             self.query_one(StatusBar).refresh_status(
-                model      = p.model.split("/")[-1],
-                cwd        = os.getcwd(),
-                tokens     = self.agent.context.estimate_tokens(),
-                max_tokens = self.agent.context.max_tokens,
-                usage      = self.agent.context.usage_percent(),
-                paused     = self.agent.is_paused,
+                model         = p.model.split("/")[-1],
+                provider_name = plabel,
+                cwd           = os.getcwd(),
+                tokens        = self.agent.context.estimate_tokens(),
+                max_tokens    = self.agent.context.max_tokens,
+                usage         = self.agent.context.usage_percent(),
+                paused        = self.agent.is_paused,
             )
         except Exception:
             pass
@@ -766,25 +779,27 @@ class AgentTUI(App):
         return self.query_one("#stream-view", StreamView)
 
     def _stream_chunk(self, text: str) -> None:
-        """Receive a text chunk from the agent thread."""
         if not self._streaming:
             self._streaming = True
         self._sv().push_chunk(text)
 
     def _stream_close(self) -> None:
-        """Finalise stream: move accumulated text into RichLog."""
         if not self._streaming:
             return
         self._streaming = False
-        sv = self._sv()
-        full_text = sv.commit()          # clears StreamView, returns full text
+        sv        = self._sv()
+        full_text = sv.commit()
         if full_text.strip():
             def _commit():
                 log = self.query_one("#log", RichLog)
-                log.write(Text(""))      # blank line before
-                for line in full_text.splitlines():
-                    log.write(Text(line, style=C.ASSISTANT))
-                log.write(Text(""))      # blank line after
+                log.write(Text(""))
+                log.write(
+                    Markdown(
+                        full_text,
+                        code_theme="monokai",
+                    )
+                )
+                log.write(Text(""))
             try:
                 self.call_from_thread(_commit)
             except Exception:
@@ -794,14 +809,18 @@ class AgentTUI(App):
         if not self._streaming:
             return
         self._streaming = False
-        sv = self._sv()
+        sv      = self._sv()
         partial = sv.cancel()
         if partial.strip():
             def _commit():
                 log = self.query_one("#log", RichLog)
                 log.write(Text(""))
-                for line in partial.splitlines():
-                    log.write(Text(line, style=C.ASSISTANT))
+                log.write(
+                    Markdown(
+                        partial,
+                        code_theme="monokai",
+                    )
+                )
                 t = Text()
                 t.append("  … interrupted", style=C.WARN)
                 log.write(t)
@@ -810,7 +829,27 @@ class AgentTUI(App):
             except Exception:
                 _commit()
 
-    def event_handler(self, event: str, data: dict) -> None:  # noqa: C901
+    
+
+    def _enter_question_mode(self, suggestions: list[str]) -> None:
+        self._question_suggestions = suggestions
+        label = self.query_one("#prompt-label", Label)
+        label.update("?›")
+        label.add_class("question-mode")
+        self.query_one("#cmd-input", Input).placeholder = (
+            "Type answer" + (f" or 1–{len(suggestions)}" if suggestions else "") + "…"
+        )
+
+    def _leave_question_mode(self) -> None:
+        self._question_suggestions = []
+        label = self.query_one("#prompt-label", Label)
+        label.update("❯")
+        label.remove_class("question-mode")
+        self.query_one("#cmd-input", Input).placeholder = "Type a task or /help…"
+
+    
+
+    def event_handler(self, event: str, data: dict) -> None:  
 
         if event == "task_started":
             self._write_many(self._R.task_started(data["prompt"]))
@@ -827,15 +866,16 @@ class AgentTUI(App):
 
         elif event == "tool_call":
             tool = data.get("tool", "")
-            if not tool or tool == "FinishTaskTool":
+            if not tool or tool in {"FinishTask", "FinishTaskTool", "Question", "QuestionTool"}:
                 return
             self._stream_close()
             self._write_many(self._R.tool_call(tool, data.get("args", {})))
 
         elif event == "tool_finished":
             self._stream_close()
-            items = self._R.tool_result(data["tool"], data.get("result"))
-            self._write_many(items)
+            tool = data.get("tool", "")
+            if tool not in {"Question", "QuestionTool"}:
+                self._write_many(self._R.tool_result(tool, data.get("result")))
 
         elif event == "tool_error":
             self._stream_close()
@@ -869,6 +909,28 @@ class AgentTUI(App):
             self._stream_close()
             self._write_many(self._R.task_error(data.get("error", "")))
 
+        elif event == "question_requested":
+            self._stream_close()
+            question    = data.get("question", "")
+            context     = data.get("context", "")
+            suggestions = data.get("suggestions", [])
+
+            self._write_many(self._R.question_request(question, context, suggestions))
+
+            self._question_answer_ref.clear()
+            self._question_done.clear()
+            self._question_needed.set()
+            try:
+                self.call_from_thread(self._enter_question_mode, suggestions)
+            except Exception:
+                self._enter_question_mode(suggestions)
+
+            self._question_done.wait()
+
+            answer = self._question_answer_ref[0] if self._question_answer_ref else ""
+            self._write_many(self._R.question_answer(answer))
+            self.agent.resolve_question(answer)
+
         elif event == "task_finished":
             self._stream_close()
             save_workspace(self.agent)
@@ -876,6 +938,8 @@ class AgentTUI(App):
                 self.call_from_thread(self._tick_status)
             except Exception:
                 pass
+
+    
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -887,7 +951,7 @@ class AgentTUI(App):
             self._approval_needed.clear()
             ans = text.lower()
             if ans == "a":
-                self.agent.approve_mode = "auto_approve"
+                self.agent.approve_mode = "always"
                 self.agent.resolve_approval(True)
             elif ans in {"y", "yes"}:
                 self.agent.resolve_approval(True)
@@ -896,9 +960,28 @@ class AgentTUI(App):
             self._approval_done.set()
             return
 
+        if self._question_needed.is_set():
+            self._question_needed.clear()
+            suggestions = self._question_suggestions
+            answer = text
+            if text.isdigit():
+                idx = int(text) - 1
+                if 0 <= idx < len(suggestions):
+                    answer = suggestions[idx]
+            self._question_answer_ref.clear()
+            self._question_answer_ref.append(answer)
+            try:
+                self.call_from_thread(self._leave_question_mode)
+            except Exception:
+                self._leave_question_mode()
+            self._question_done.set()
+            return
+
         self._dispatch(text)
 
-    def _dispatch(self, text: str) -> None:  # noqa: C901
+    
+
+    def _dispatch(self, text: str) -> None:  
         t = text.strip()
 
         def info(msg: str) -> None:
@@ -909,39 +992,40 @@ class AgentTUI(App):
 
         def err(msg: str) -> None:
             r = Text(); r.append("  ✗ ", style=C.ERR); r.append(msg); self._write(r)
+
         if t in {"/quit", "/exit"}:
             self.exit()
+
         elif t in {"/help", "?"}:
             tbl = Table(border_style="grey30", show_header=False, padding=(0, 2),
                         box=None, pad_edge=False)
-            tbl.add_column("cmd",  style="bold cyan",  no_wrap=True, min_width=32)
+            tbl.add_column("cmd",  style="bold cyan", no_wrap=True, min_width=32)
             tbl.add_column("desc", style="grey62")
             rows = [
-                ("/help",                     "This help"),
-                ("/tools",                    "List tools"),
-                ("/models",                   "List models"),
-                ("/model <name> | next",       "Switch model"),
-                ("/model-picker  (Ctrl+M)",    "Interactive model picker"),
-                ("/settings  (Ctrl+S)",        "Settings modal"),
-                ("/context",                  "Token usage"),
-                ("/history",                  "Message history"),
-                ("/reset",                    "Clear context"),
-                ("/approve [ask_all|ask_unsafe|auto_approve]", "Approval mode"),
-                ("/provider [name|reset]",    "Switch provider"),
-                ("/baseurl [url]",            "Show / set base URL"),
-                ("/set_context_length <n>",   "Max tokens"),
-                ("/compress_context",         "Compress now"),
-                ("/pause  /resume  Ctrl+P",   "Pause / resume"),
-                ("/steer [text|clear]",       "Steering instructions"),
-                ("/queue",                    "Task queue"),
-                ("/clear",                    "Clear log"),
-                ("/quit",                     "Exit"),
+                ("/help",                                    "This help"),
+                ("/tools",                                   "List tools"),
+                ("/model-picker  (Ctrl+M)",                  "Model picker"),
+                ("/provider  (Ctrl+R)",                      "Provider picker"),
+                ("/settings  (Ctrl+S)",                      "Settings modal"),
+                ("/context",                                 "Token usage"),
+                ("/history",                                 "Message history"),
+                ("/reset",                                   "Clear context"),
+                ("/approve [never|safe|always]","Approval mode"),
+                ("/baseurl [url]",                           "Show / set base URL"),
+                ("/set_context_length <n>",                  "Max tokens"),
+                ("/compress_context",                        "Compress now"),
+                ("/pause  /resume  Ctrl+P",                  "Pause / resume"),
+                ("/steer [text|clear]",                      "Steering instructions"),
+                ("/queue",                                   "Task queue"),
+                ("/clear",                                   "Clear log"),
+                ("/quit",                                    "Exit"),
             ]
             for cmd, desc in rows:
                 tbl.add_row(cmd, desc)
             self._write(Text(""))
             self._write(tbl)
             self._write(Text(""))
+
         elif t == "/tools":
             names = sorted(
                 self.agent.tools.keys()
@@ -955,124 +1039,97 @@ class AgentTUI(App):
                 r.append(n, style=C.TOOL_NAME)
                 self._write(r)
             self._write(Text(""))
-        elif t == "/models":
-            models = self.agent.provider.get_models()
-            if isinstance(models, dict):
-                err(models.get("error", "unknown")); return
-            cur = self.agent.provider.model
-            self._write(Text(""))
-            for m in models:
-                r = Text()
-                if m == cur:
-                    r.append("  ● ", style="bold green")
-                    r.append(m, style="bold white")
-                else:
-                    r.append("  ○ ", style=C.MUTED)
-                    r.append(m, style=C.DIM)
-                self._write(r)
-            self._write(Text(""))
-        elif t == "/model":
-            info(f"Model: {self.agent.provider.model}")
-
-        elif t == "/model next":
-            models = self.agent.provider.get_models()
-            if not isinstance(models, list) or not models:
-                err("No models"); return
-            cur = self.agent.provider.model
-            try:   idx = models.index(cur)
-            except ValueError: idx = -1
-            self._set_model(models[(idx + 1) % len(models)])
-
-        elif t.startswith("/model "):
-            self._set_model(t.split(maxsplit=1)[1].strip())
-
-        elif t == "/model-picker":
-            self.action_open_model_picker()
 
         elif t == "/settings":
             self.action_open_settings()
+
+        elif t == "/provider":
+            self.action_open_provider_picker()
+
         elif t == "/context":
             tok   = self.agent.context.estimate_tokens()
             max_t = self.agent.context.max_tokens
             use   = self.agent.context.usage_percent()
             col   = _token_color(use)
             r = Text()
-            r.append(f"  Messages: ", style=C.MUTED)
+            r.append("  Messages: ", style=C.MUTED)
             r.append(f"{len(self.agent.context.messages)}", style="white")
-            r.append(f"   Tokens: ", style=C.MUTED)
+            r.append("   Tokens: ", style=C.MUTED)
             r.append(f"{tok:,} / {max_t:,}", style=col)
             r.append(f"  ({use:.0f}%)", style=col)
+            r.append(f"  {_context_bar(use)}", style="")
             self._write(r)
+
         elif t == "/history":
             msgs = self.agent.context.messages
             if not msgs:
-                info("History is empty"); return
+                info("History is empty")
+                return
             for i, msg in enumerate(msgs, 1):
                 content = msg.content
-                if hasattr(content, "text"): content = content.text
+                if hasattr(content, "text"):
+                    content = content.text
                 preview = str(content)[:300].replace("\n", " ")
                 r = Text()
                 r.append(f"  {i:3}  ", style=C.MUTED)
                 r.append(f"{msg.role:<12}", style="bold cyan" if msg.role == "assistant" else "bold white")
                 r.append(preview, style=C.DIM)
                 self._write(r)
+
         elif t == "/reset":
             self.agent.context = Context(provider=self.agent.provider)
             self.agent.context.compression_callback = self.agent._on_context_compressed
+            self.agent.context.set_system_prompt(self.agent._system_prompt)
             save_workspace(self.agent)
             ok("Context cleared")
             self._tick_status()
+
         elif t == "/clear":
             self.query_one("#log", RichLog).clear()
+
         elif t == "/approve":
             info(f"Approval mode: {self.agent.approve_mode}")
 
         elif t.startswith("/approve "):
             mode = t.split(maxsplit=1)[1].strip()
-            if mode not in {"safe", "always", "never"}:
-                err("Valid: safe | always | never"); return
+            if mode not in {"never", "safe", "always"}:
+                err("Valid: never | safe | always")
+                return
             self.agent.approve_mode = mode
             cfg = load_config(); cfg["approve_mode"] = mode
             save_config(cfg); save_workspace(self.agent)
             ok(f"Approval → {mode}")
-        elif t == "/provider":
-            info(f"Provider: {self.agent.provider.__class__.__name__}")
 
-        elif t.startswith("/provider "):
-            name = t.split(maxsplit=1)[1].strip()
-            if name == "reset":
-                cfg = load_config()
-                cfg.pop("provider", None); cfg.pop("model", None)
-                self.agent.provider = NonSelectedProvider()
-                save_config(cfg); save_workspace(self.agent)
-                ok("Provider reset")
-            else:
-                self._switch_provider(name)
         elif t == "/baseurl":
             info(f"Base URL: {getattr(self.agent.provider, 'base_url', 'N/A')}")
 
         elif t.startswith("/baseurl "):
             url = t.split(maxsplit=1)[1].strip()
             p = self.agent.provider
-            if hasattr(p,"set_base_url"): p.set_base_url(url)
-            elif hasattr(p,"base_url"):   p.base_url = url
+            if hasattr(p, "set_base_url"):
+                p.set_base_url(url)
+            elif hasattr(p, "base_url"):
+                p.base_url = url
             cfg = load_config(); cfg["base_url"] = url
             save_config(cfg); save_workspace(self.agent)
             ok(f"Base URL → {url}")
+
         elif t.startswith("/set_context_length "):
             val = t.split(maxsplit=1)[1].strip()
             if not val.isdigit():
-                err("Usage: /set_context_length <n>"); return
+                err("Usage: /set_context_length <n>")
+                return
             n = int(val)
             self.agent.provider.context_length = n
-            self.agent.context.max_tokens = n
             cfg = load_config(); cfg["context_length"] = n
             save_config(cfg); save_workspace(self.agent)
             ok(f"Context length → {n:,}")
             self._tick_status()
+
         elif t == "/compress_context":
             info("Compressing context…")
             self.agent.context.compress()
+
         elif t == "/pause":
             self.agent.pause()
             r = Text(); r.append("  ⏸ Paused", style=C.WARN)
@@ -1082,6 +1139,7 @@ class AgentTUI(App):
             self.agent.resume()
             r = Text(); r.append("  ▶ Resumed", style=C.OK)
             self._write(r); self._tick_status()
+
         elif t == "/steer":
             instrs = getattr(self.agent.steering, "instructions", [])
             if not instrs:
@@ -1094,16 +1152,20 @@ class AgentTUI(App):
                     self._write(r)
 
         elif t == "/steer clear":
-            self.agent.clear_instructions(); ok("Steering cleared")
+            self.agent.clear_instructions()
+            ok("Steering cleared")
 
         elif t.startswith("/steer "):
             instr = t[len("/steer "):]
-            self.agent.add_instruction(instr); ok(f"Steering: {instr}")
+            self.agent.add_instruction(instr)
+            ok(f"Steering: {instr}")
+
         elif t == "/queue":
             items = list(self.agent.task_queue.queue)
             cur   = self.agent.current_task
             if not cur and not items:
-                info("Queue empty"); return
+                info("Queue empty")
+                return
             if cur:
                 r = Text()
                 r.append("  ▶ ", style="bold cyan")
@@ -1121,41 +1183,48 @@ class AgentTUI(App):
         else:
             self.agent.enqueue(prompt=t, task_id=str(time.time()))
 
+    
+
     def _set_model(self, model: str) -> None:
-        models = self.agent.provider.get_models()
-        if isinstance(models, list) and model not in models:
-            r = Text(); r.append("  ✗ ", style=C.ERR); r.append(f"Unknown model: {model}")
+        try:
+            models = self.agent.provider.get_models()
+            if isinstance(models, list) and model not in models:
+                r = Text(); r.append("  ✗ ", style=C.ERR); r.append(f"Unknown model: {model}")
+                self._write(r); return
+        except Exception:
+            pass
+        try:
+            self.agent.provider.set_model(model)
+        except Exception as e:
+            r = Text(); r.append("  ✗ ", style=C.ERR); r.append(str(e))
             self._write(r); return
-        self.agent.provider.set_model(model)
         cfg = load_config(); cfg["model"] = model
         save_config(cfg); save_workspace(self.agent)
         r = Text(); r.append("  ✓ ", style=C.OK); r.append(f"Model → {model}", style=C.DIM)
         self._write(r); self._tick_status()
 
-    def _switch_provider(self, name: str) -> None:
+    def _apply_provider_result(self, result) -> None:
+        if result is None:
+            return
+        name, cfg = result
         tools = (
             list(self.agent.tools.values())
             if isinstance(self.agent.tools, dict)
             else self.agent.tools
         )
-        cur_model = self.agent.provider.model
-        cfg = load_config()
-        if name == "openai":
-            key = cfg.get("openai_api_key") or os.getenv("OPENAI_API_KEY","")
-            p = OpenAICompatibleProvider(api_key=key, model=cur_model,
-                base_url="https://api.openai.com/v1", tools=tools)
-        elif name == "openrouter":
-            key = cfg.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY","")
-            p = OpenAICompatibleProvider(api_key=key, model=cur_model,
-                base_url="https://openrouter.ai/api/v1", tools=tools)
-        else:
-            key = cfg.get("api_key") or os.getenv("API_KEY","dummy")
-            p = OpenAICompatibleProvider(api_key=key, model=cur_model,
-                base_url=cfg.get("base_url","http://localhost:1234/v1/"), tools=tools)
-        self.agent.provider = p
-        cfg["provider"] = name; save_config(cfg); save_workspace(self.agent)
-        r = Text(); r.append("  ✓ ", style=C.OK); r.append(f"Provider → {name}", style=C.DIM)
-        self._write(r); self._tick_status()
+        try:
+            new_provider = _build_provider(name, cfg, tools, self.agent.provider.model)
+            self.agent.provider = new_provider
+            save_workspace(self.agent)
+            r = Text()
+            r.append("  ✓ ", style=C.OK)
+            pdef = PROVIDER_DEFS.get(name, {})
+            r.append(f"Provider → {pdef.get('label', name)}", style=C.DIM)
+            self._write(r)
+            self._tick_status()
+        except Exception as e:
+            r = Text(); r.append("  ✗ ", style=C.ERR); r.append(f"Provider error: {e}")
+            self._write(r)
 
     def action_toggle_pause(self) -> None:
         if self.agent.is_paused:
@@ -1177,6 +1246,9 @@ class AgentTUI(App):
                 self._tick_status()
         self.push_screen(SettingsModal(self.agent), _cb)
 
+    def action_open_provider_picker(self) -> None:
+        self.push_screen(ProviderPickerModal(self.agent), self._apply_provider_result)
+
     def action_open_model_picker(self) -> None:
         try:
             models = self.agent.provider.get_models()
@@ -1186,8 +1258,10 @@ class AgentTUI(App):
         if not isinstance(models, list) or not models:
             r = Text(); r.append("  ", style=""); r.append("No models available", style=C.MUTED)
             self._write(r); return
-        self.push_screen(ModelPickerModal(models, self.agent.provider.model),
-                         lambda m: m and self._set_model(m))
+        self.push_screen(
+            ModelPickerModal(models, self.agent.provider.model),
+            lambda m: m and self._set_model(m),
+        )
 
     def run_tui(self) -> None:
         self.run()

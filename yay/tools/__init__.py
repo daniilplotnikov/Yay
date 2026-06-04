@@ -1,5 +1,5 @@
 from .console import ShellTool
-from .files import CreateFileTool, RemoveFileTool, SearchTool, PatchFileTool, ListFilesTool, ReadFileTool, GetFileInfoTool, GrepTool, GlobTool, CreateDirectoryTool, PDFTool, TreeTool
+from .files import CreateFileTool, RemoveFileTool, SearchTool, PatchFileTool, ListFilesTool, ReadFileTool, ReadFilesTool, GetFileInfoTool, GrepTool, GlobTool, CreateDirectoryTool, PDFTool, TreeTool
 from .finish import FinishTaskTool
-from .think import ThinkTool, PlanTool
+from .think import ThinkTool, PlanTool, QuestionTool
 from .web import WebSearchTool, WebVisitTool
