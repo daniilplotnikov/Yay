@@ -1,18 +1,3 @@
-"""
-MCPClient – full MCP protocol client.
-
-Covers all capability groups:
-  • tools       – list / call
-  • resources   – list / read / subscribe / unsubscribe
-  • prompts     – list / get
-  • sampling    – createMessage (client-side handler)
-  • roots       – list (client-side handler)
-  • logging     – setLevel
-  • ping        – connection keepalive
-  • cancellation – $/cancelRequest notification
-  • progress    – $/progress notification handler
-"""
-
 from __future__ import annotations
 
 import threading

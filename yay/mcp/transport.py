@@ -1,12 +1,3 @@
-"""
-MCP Transport implementations per MCP specification.
-
-Supported transports:
-  - HTTP + SSE  (StreamableHTTP, legacy SSE)
-  - stdio       (subprocess)
-  - WebSocket   (ws://)
-"""
-
 from __future__ import annotations
 
 import json

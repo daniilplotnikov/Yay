@@ -1,24 +1,3 @@
-"""
-MCPManager – manages multiple MCP servers across any transport.
-
-Supports:
-  • HTTP+SSE servers  (http:// / https://)
-  • WebSocket servers (ws:// / wss://)
-  • stdio servers     (subprocess command)
-
-Server entries::
-
-    
-    manager.add("http://localhost:3000")
-    manager.add("ws://localhost:4000")
-
-    
-    manager.add_stdio(["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
-
-Capabilities fetched: tools, resources, prompts.
-All are registered into the provided tools_manager (if any).
-"""
-
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -31,11 +10,6 @@ from .transport import (
     transport_from_url,
     stdio_transport,
 )
-
-
-
-
-
 
 class _ServerConfig:
     """Internal representation of a registered MCP server."""
