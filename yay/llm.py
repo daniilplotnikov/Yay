@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
-
+from .events import EventBus, ContextCompressionNeededEvent
 SYSTEM_SUMMARY_MARKER = "[COMPRESSED_CONTEXT]"
 
 
@@ -10,7 +10,7 @@ class Content:
     def __init__(self, text: str = "") -> None:
         self.text = text
 
-    def __repr__(self) -> str:  # handy for debugging
+    def __repr__(self) -> str:
         preview = self.text[:60].replace("\n", "\\n")
         return f"Content({preview!r}{'…' if len(self.text) > 60 else ''})"
 
@@ -43,12 +43,14 @@ class Context:
         compress_threshold: float = 0.8,
         compression_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         system_prompt: Optional[str] = None,
+        bus: EventBus = None
     ) -> None:
         self.provider = provider
         self.messages: List[Message] = []
         self.compress_threshold = compress_threshold
         self.compression_callback = compression_callback
         self._system_prompt: Optional[str] = None
+        self.bus = bus
 
         if system_prompt:
             self.set_system_prompt(system_prompt)
@@ -67,8 +69,11 @@ class Context:
             and getattr(message.content, "text", "").startswith(SYSTEM_SUMMARY_MARKER)
         ):
             self._insert_summary(message)
-            return
-        self.messages.append(message)
+        else:
+            self.messages.append(message)
+
+        if self.bus and self.needs_compression():
+            self.bus.emit(ContextCompressionNeededEvent())
 
     def _insert_summary(self, summary_msg: Message) -> None:
         self.messages = [
@@ -154,8 +159,3 @@ class Context:
             )
 
         return True
-
-    def compress_if_needed(self) -> bool:
-        if self.needs_compression():
-            return self.compress()
-        return False

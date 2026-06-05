@@ -5,6 +5,7 @@ from openai import OpenAI
 from ..llm import Message, Content
 from ..provider import Provider
 from ..managers import ToolsManager
+from ..events import EventBus, ErrorEvent
 
 
 class OpenAICompatibleProvider(Provider):
@@ -18,6 +19,7 @@ class OpenAICompatibleProvider(Provider):
         model: str,
         base_url: str,
         tools_manager: ToolsManager,
+        bus: EventBus
     ):
         self._api_key = api_key
         self._base_url = base_url
@@ -30,10 +32,16 @@ class OpenAICompatibleProvider(Provider):
         self.name = "OpenAICompatibleProvider"
         self.model = model
         self.tools_manager = tools_manager
+        self.bus = bus
 
         try:
             self.context_length = self._detect_context_size()
-        except Exception:
+        except Exception as e:
+            self.bus.emit(ErrorEvent(
+                source=self.name,
+                message=f"Failed to detect context size, defaulting to 128000: {e}",
+                traceback=traceback.format_exc()
+            ))
             self.context_length = 128000
 
     def _request(self, **kwargs):
@@ -43,6 +51,11 @@ class OpenAICompatibleProvider(Provider):
                 return self.client.chat.completions.create(**kwargs)
             except Exception as e:
                 last_error = e
+                self.bus.emit(ErrorEvent(
+                    source=self.name,
+                    message=f"Request attempt {attempt + 1}/{self.RETRY_COUNT} failed: {e}",
+                    traceback=traceback.format_exc()
+                ))
                 if attempt < self.RETRY_COUNT - 1:
                     time.sleep(self.RETRY_DELAY * (attempt + 1))
         raise last_error
@@ -91,7 +104,6 @@ class OpenAICompatibleProvider(Provider):
         return messages
 
     def _tools(self) -> list | None:
-
         if not self.tools_manager:
             return None
         tools = self.tools_manager.get_tools()
@@ -123,7 +135,7 @@ class OpenAICompatibleProvider(Provider):
                 "arguments": args,
             })
         return calls
-    
+
     def get_models(self) -> list | dict:
         try:
             models = self.client.models.list()
@@ -134,14 +146,23 @@ class OpenAICompatibleProvider(Provider):
             ]
             return sorted(result)
         except Exception as e:
+            self.bus.emit(ErrorEvent(
+                source=self.name,
+                message=f"Failed to fetch model list: {e}",
+                traceback=traceback.format_exc()
+            ))
             return {"error": str(e)}
 
     def set_model(self, model: str) -> None:
         self.model = model
         try:
             self.context_length = self._detect_context_size()
-        except Exception:
-            pass 
+        except Exception as e:
+            self.bus.emit(ErrorEvent(
+                source=self.name,
+                message=f"Failed to detect context size after model change: {e}",
+                traceback=traceback.format_exc()
+            ))
 
     def set_base_url(self, base_url: str) -> str:
         self._base_url = base_url
@@ -160,7 +181,6 @@ class OpenAICompatibleProvider(Provider):
 
         response = self._request(**kwargs)
         msg = response.choices[0].message
-
         content_text = getattr(msg, "content", None) or ""
 
         raw_tool_calls = getattr(msg, "tool_calls", None)
@@ -171,7 +191,12 @@ class OpenAICompatibleProvider(Provider):
                     args = json.loads(
                         getattr(tc.function, "arguments", "{}") or "{}"
                     )
-                except Exception:
+                except Exception as e:
+                    self.bus.emit(ErrorEvent(
+                        source=self.name,
+                        message=f"Failed to parse tool call arguments for '{tc.function.name}': {e}",
+                        traceback=traceback.format_exc()
+                    ))
                     args = {}
                 calls.append({
                     "id":        tc.id or "",
@@ -209,7 +234,11 @@ class OpenAICompatibleProvider(Provider):
                 break
             except Exception as e:
                 last_error = e
-                print(f"[STREAM] attempt {attempt + 1}/{self.RETRY_COUNT}: {e}")
+                self.bus.emit(ErrorEvent(
+                    source=self.name,
+                    message=f"Stream attempt {attempt + 1}/{self.RETRY_COUNT} failed: {e}",
+                    traceback=traceback.format_exc()
+                ))
                 if attempt < self.RETRY_COUNT - 1:
                     time.sleep(self.RETRY_DELAY * (attempt + 1))
 
@@ -217,7 +246,7 @@ class OpenAICompatibleProvider(Provider):
             raise last_error
 
         content: list[str] = []
-        tool_calls: dict[int, dict] = {} 
+        tool_calls: dict[int, dict] = {}
 
         try:
             for chunk in stream:
@@ -248,9 +277,11 @@ class OpenAICompatibleProvider(Provider):
                             tool_calls[idx]["arguments"] += fn.arguments
 
         except Exception as e:
-            print("[STREAM ERROR]", repr(e))
-            traceback.print_exc()
-
+            self.bus.emit(ErrorEvent(
+                source=self.name,
+                message=f"Error while reading stream: {e}",
+                traceback=traceback.format_exc()
+            ))
             if content:
                 return Message(
                     role="assistant",
@@ -274,24 +305,32 @@ class OpenAICompatibleProvider(Provider):
             if text.strip():
                 history.append(f"[{m.role}] {text}")
 
-        response = self._request(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Create a concise summary of the conversation. "
-                        "Keep important facts, user requirements, decisions, "
-                        "tool results, generated files and current task state."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": "\n".join(history) or "(empty conversation)",
-                },
-            ],
-        )
-        return response.choices[0].message.content or "Conversation summary unavailable."
+        try:
+            response = self._request(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Create a concise summary of the conversation. "
+                            "Keep important facts, user requirements, decisions, "
+                            "tool results, generated files and current task state."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": "\n".join(history) or "(empty conversation)",
+                    },
+                ],
+            )
+            return response.choices[0].message.content or "Conversation summary unavailable."
+        except Exception as e:
+            self.bus.emit(ErrorEvent(
+                source=self.name,
+                message=f"Failed to summarize conversation: {e}",
+                traceback=traceback.format_exc()
+            ))
+            return "Conversation summary unavailable."
 
     def _detect_context_size(self) -> int:
         def find_context(obj, depth: int = 0) -> int | None:
@@ -309,7 +348,6 @@ class OpenAICompatibleProvider(Provider):
                                 return n
                         except (ValueError, TypeError):
                             pass
-                # recurse into values (but not into strings/ints)
                 for v in obj.values():
                     if isinstance(v, (dict, list)) or hasattr(v, "__dict__"):
                         result = find_context(v, depth + 1)
@@ -344,8 +382,12 @@ class OpenAICompatibleProvider(Provider):
                         result = find_context(model)
                         if result:
                             return result
-            except Exception:
-                pass
+            except Exception as e:
+                self.bus.emit(ErrorEvent(
+                    source=self.name,
+                    message=f"Failed to fetch context size from OpenRouter: {e}",
+                    traceback=traceback.format_exc()
+                ))
 
         try:
             models = self.client.models.list()
@@ -362,7 +404,11 @@ class OpenAICompatibleProvider(Provider):
                 result = find_context(model)
                 if result:
                     return result
-        except Exception:
-            pass
+        except Exception as e:
+            self.bus.emit(ErrorEvent(
+                source=self.name,
+                message=f"Failed to fetch context size from model list: {e}",
+                traceback=traceback.format_exc()
+            ))
 
         return 128000

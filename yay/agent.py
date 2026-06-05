@@ -3,34 +3,39 @@ from __future__ import annotations
 import json
 import threading
 from queue import Queue
-from typing import Any, Callable, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 from .llm import Content, Context, Message
 from .managers import ToolsManager
 from .provider import Provider
 from .steering import SteeringState
 from .task import Task
+from .events import EventBus, TaskStartedEvent, ModelProcessingEvent, ApprovalRequestedEvent, \
+    StreamChunkEvent, ProviderResponseEvent, TaskFinishedEvent, TaskErrorEvent, ToolCallEvent, \
+    ToolFinishedEvent, ContextCompressedEvent, ContextCompressionErrorEvent, ApprovalGrantedEvent,\
+    ApprovalDeniedEvent, AgentPausedEvent, AgentResumedEvent, ToolStartedEvent, ToolErrorEvent,\
+    QuestionRequestedEvent, ContextCompressionNeededEvent
 
 ApproveMode = Literal["never", "safe", "always"]
 
 class Agent:
     def __init__(
         self,
+        bus: EventBus,
         provider: Provider,
         context: Context,
         tools_manager: ToolsManager,
-        approve_mode: ApproveMode = "never",
-        approval_callback: Optional[Callable] = None,
-        event_callback: Optional[Callable] = None,
+        approve_mode: ApproveMode = "never"
     ) -> None:
+        
+        self.bus = bus
+
         self.provider = provider
         self.context = context
         self.context.compression_callback = self._on_context_compressed
 
         self.steering = SteeringState()
         self.approve_mode: ApproveMode = approve_mode
-        self.approval_callback = approval_callback
-        self.event_callback = event_callback
         self.tools_manager = tools_manager
 
         self._approval_event = threading.Event()
@@ -47,14 +52,17 @@ class Agent:
         self.running = False
         self.current_task: Optional[Task] = None
 
-    def emit(self, event: str, data: Optional[Dict[str, Any]] = None) -> None:
-        if self.event_callback:
-            self.event_callback(event, data or {})
+        self.bus.subscribe(ApprovalGrantedEvent)(self._on_approval_granted)
+        self.bus.subscribe(ApprovalDeniedEvent)(self._on_approval_denied)
+        self.bus.subscribe(QuestionRequestedEvent)(self._on_question_requested)
+        self.bus.subscribe(ContextCompressionNeededEvent)(self._on_compression_needed)
 
     def pause(self) -> None:
+        self.bus.emit(AgentPausedEvent())
         self._pause_event.clear()
 
     def resume(self) -> None:
+        self.bus.emit(AgentResumedEvent())
         self._pause_event.set()
 
     @property
@@ -97,12 +105,7 @@ class Agent:
         self._approval_event.clear()
         self._approval_result = None
 
-        self.emit("approval_requested", {"tool": tool_name, "args": args})
-
-        if self.approval_callback:
-            result = self.approval_callback(tool_name, args)
-            self._approval_result = bool(result)
-            return self._approval_result
+        self.bus.emit(ApprovalRequestedEvent(tool=tool_name, args=args))
 
         self._approval_event.wait()
         return bool(self._approval_result)
@@ -111,9 +114,19 @@ class Agent:
         self._approval_result = value
         self._approval_event.set()
 
+    def _on_approval_granted(self, e: ApprovalGrantedEvent) -> None:
+        self.resolve_approval(True)
+
+    def _on_approval_denied(self, e: ApprovalDeniedEvent) -> None:
+        self.resolve_approval(False)
+
     def resolve_question(self, answer: str) -> None:
         self._question_answer = answer
         self._question_event.set()
+
+    def _on_question_requested(self, e: QuestionRequestedEvent) -> None:
+        self._question_event.clear()
+        self._question_answer = None
 
     def add_instruction(self, text: str) -> None:
         self.steering.instructions.append(text)
@@ -150,7 +163,7 @@ class Agent:
         return None
 
     def work_loop(self, prompt: str) -> Any:
-        self.emit("task_started", {"prompt": prompt})
+        self.bus.emit(TaskStartedEvent(prompt=prompt))
 
         steering_text = self._build_steering_prompt()
         full_prompt = f"{steering_text}\n\n{prompt}" if steering_text else prompt
@@ -158,20 +171,18 @@ class Agent:
         self.context.append(
             Message(role="user", content=Content(text=full_prompt))
         )
-        self._compress_context_if_needed()
 
         while True:
             self.wait_if_paused()
-            self.emit("model_processing")
+            self.bus.emit(ModelProcessingEvent())
 
             response = self.provider.process_stream(
                 self.context,
-                on_chunk=lambda data: self.emit("stream_chunk", data),
+                on_chunk=lambda data: self.bus.emit(StreamChunkEvent(data=data)),
             )
 
             self.context.append(response)
-            self._compress_context_if_needed()
-            self.emit("provider_response", {"message": response})
+            self.bus.emit(ProviderResponseEvent(message=response))
 
             tool_call = self._extract_tool_call(response)
 
@@ -183,19 +194,19 @@ class Agent:
                         "Model returned an empty response (no tool call, no text). "
                         f"Raw content: {getattr(response.content, 'text', None)!r}"
                     )
-                self.emit("task_finished", {"result": text})
+                self.bus.emit(TaskFinishedEvent(result=text))
                 return text
 
             tool_name    = tool_call.get("name")
             args         = tool_call.get("args", {})
             tool_call_id = tool_call.get("id")
 
-            self.emit("tool_call", {"tool": tool_name, "args": args})
+            self.bus.emit(ToolCallEvent(tool=tool_name, args=args))
 
             if self.needs_approval(tool_name):
                 approved = self.request_approval(tool_name, args)
                 if not approved:
-                    self.emit("approval_denied", {"tool": tool_name})
+                    self.bus.emit(ApprovalDeniedEvent(tool=tool_name))
                     self.context.append(
                         Message(
                             role="tool",
@@ -204,18 +215,17 @@ class Agent:
                             content=Content(text="Tool execution denied by user"),
                         )
                     )
-                    self._compress_context_if_needed()
                     continue
-                self.emit("approval_granted", {"tool": tool_name})
+                self.bus.emit(ApprovalGrantedEvent(tool=tool_name))
 
-            self.emit("tool_started", {"tool": tool_name})
+            self.bus.emit(ToolStartedEvent(tool=tool_name))
             self.wait_if_paused()
 
             try:
                 result = self.run_tool(tool_name, args)
             except Exception as e:
                 result = {"error": str(e)}
-                self.emit("tool_error", {"tool": tool_name, "error": str(e)})
+                self.bus.emit(ToolErrorEvent(tool=tool_name, error=e))
                 self.context.append(
                     Message(
                         role="tool",
@@ -224,7 +234,6 @@ class Agent:
                         content=Content(text=json.dumps(result, ensure_ascii=False)),
                     )
                 )
-                self._compress_context_if_needed()
                 continue
 
             if (
@@ -234,7 +243,7 @@ class Agent:
             ):
                 self._question_event.clear()
                 self._question_answer = None
-                self.emit("question_requested", result)
+                self.bus.emit(QuestionRequestedEvent(payload=result))
 
                 self._question_event.wait()
                 answer = self._question_answer or ""
@@ -250,11 +259,10 @@ class Agent:
                 self.context.append(
                     Message(role="user", content=Content(text=answer))
                 )
-                self._compress_context_if_needed()
                 continue
 
             if tool_name in {"FinishTask", "FinishTaskTool"}:
-                self.emit("tool_finished", {"tool": tool_name, "result": result})
+                self.bus.emit(ToolFinishedEvent(tool=tool_name, result=result))
                 self.context.append(
                     Message(
                         role="tool",
@@ -266,11 +274,10 @@ class Agent:
                         ),
                     )
                 )
-                self._compress_context_if_needed()
-                self.emit("task_finished", {"result": result})
+                self.bus.emit(TaskFinishedEvent(result=result))
                 return result
 
-            self.emit("tool_finished", {"tool": tool_name, "result": result})
+            self.bus.emit(ToolFinishedEvent(tool=tool_name, result=result))
             self.context.append(
                 Message(
                     role="tool",
@@ -282,7 +289,6 @@ class Agent:
                     ),
                 )
             )
-            self._compress_context_if_needed()
 
     def _queue_loop(self) -> None:
         while self.running:
@@ -295,7 +301,7 @@ class Agent:
             try:
                 self.work_loop(task.prompt)
             except Exception as e:
-                self.emit("task_error", {"task_id": task.task_id, "error": str(e)})
+                self.bus.emit(TaskErrorEvent(task_id=task.task_id, error=e))
             finally:
                 self.current_task = None
                 self.task_queue.task_done()
@@ -315,11 +321,11 @@ class Agent:
     def stop_queue(self) -> None:
         self.running = False
 
-    def _compress_context_if_needed(self) -> None:
-        try:
-            self.context.compress_if_needed()
-        except Exception as e:
-            self.emit("context_compression_error", {"error": str(e)})
-
     def _on_context_compressed(self, info: Dict[str, Any]) -> None:
-        self.emit("context_compressed", info)
+        self.bus.emit(ContextCompressedEvent(info=info))
+
+    def _on_compression_needed(self, e: ContextCompressionNeededEvent) -> None:
+        try:
+            self.context.compress()
+        except Exception as ex:
+            self.bus.emit(ContextCompressionErrorEvent(error=ex))

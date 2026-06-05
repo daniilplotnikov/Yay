@@ -1,14 +1,15 @@
 import inspect
 import importlib
+import traceback
 import pkgutil
 
 from ..tool import Tool
-
+from ..events import EventBus, ErrorEvent
 
 class ToolsManager:
-
-    def __init__(self, package):
+    def __init__(self, package, bus):
         self.package = package
+        self.bus = bus
 
         self._tools = {}
         self._enabled = set()
@@ -27,10 +28,12 @@ class ToolsManager:
                 )
 
             except Exception as e:
-                print(
-                    f"Failed importing "
-                    f"{module_name}: {e}"
-                )
+                self.bus.emit(ErrorEvent(
+                    source='ToolsManager',
+                    message=f"Failed importing "
+                    f"{module_name}: {e}",
+                    traceback=traceback.format_exc()
+                ))
                 continue
 
             for _, cls in inspect.getmembers(
@@ -60,10 +63,13 @@ class ToolsManager:
                     self._enabled.add(name)
 
                 except Exception as e:
-                    print(
-                        f"Failed creating "
-                        f"{cls.__name__}: {e}"
-                    )
+                    self.bus.emit(ErrorEvent(
+                        source='ToolsManager',
+                        message=f"Failed creating "
+                        f"{cls.__name__}: {e}",
+                        traceback=traceback.format_exc()
+                    ))
+                    continue
 
     def register(self, tool):
         name = tool.name

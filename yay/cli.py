@@ -9,20 +9,23 @@ from .managers import (
     ProviderManager,
     ToolsManager,
 )
+from .events import EventBus
+from .mcp import MCPManager
 
-tools_manager = ToolsManager(tools_pkg)
-providers_manager = ProviderManager(providers_pkg)
+bus = EventBus()
+tools_manager = ToolsManager(tools_pkg, bus)
+providers_manager = ProviderManager(providers_pkg, bus)
+mcp_manager = MCPManager(tools_manager, bus)
+
 tools_manager.load()
 providers_manager.load()
 
 def run_tui():
-    agent = build_agent(tools_manager=tools_manager, providers_manager=providers_manager)
+    agent = build_agent(bus=bus, tools_manager=tools_manager, providers_manager=providers_manager)
 
     agent.start_queue()
 
-    tui = AgentTUI(agent, providers_manager, tools_manager)
-
-    agent.event_callback = tui.event_handler
+    tui = AgentTUI(bus=bus, agent=agent, providers_manager=providers_manager, tools_manager=tools_manager, mcp_manager=mcp_manager)
 
     tui.run()
 
@@ -32,6 +35,6 @@ def main():
     has_pipe = not sys.stdin.isatty()
 
     if has_args or has_pipe:
-        return run_shell()
+        return run_shell(bus=bus, tools_manager=tools_manager, providers_manager=providers_manager, mcp_manager=mcp_manager)
 
     return run_tui()

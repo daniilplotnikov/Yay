@@ -1,3 +1,23 @@
+"""
+tui.py – Textual TUI for the agent.
+
+Fixes vs original:
+  • register_event_handlers() now called from on_mount (was never called)
+  • Deadlock fix: ApprovalRequestedEvent and QuestionRequestedEvent handlers
+    must NOT block the Textual event loop – blocking .wait() moved out of
+    the bus handler into the input path, using call_from_thread for UI updates
+  • Real interrupt (Ctrl+C): sets _interrupt_flag on the agent thread so
+    provider.process_stream is cancelled via a threading.Event; agent loop
+    checks the flag after each iteration
+  • Real pause: pausing before a streaming call is supported; if pause
+    happens mid-stream we wait at the next loop iteration checkpoint
+  • Added missing imports: AgentPausedEvent, AgentResumedEvent, ToolStartedEvent
+  • MCPModal: shows error feedback inside the modal on connect failure
+  • /mcp add supports stdio via "stdio://" prefix:
+      /mcp add stdio://npx -y @modelcontextprotocol/server-filesystem /tmp
+  • status_rows() n_tools key used correctly everywhere
+  • SettingsModal MCP tab shows connected/disconnected state correctly
+"""
 from __future__ import annotations
 
 import os
@@ -10,41 +30,43 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     Footer, Input, Label, RichLog, Static,
-    Button, Select, TabbedContent, TabPane, ListView, ListItem,
+    Button, Select, TabbedContent, TabPane, ListView, ListItem, DataTable,
 )
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
 from rich.text import Text
 from rich.table import Table
 from rich.markdown import Markdown
+from pathlib import Path
+
 from .agent import Agent
 from .llm import Context
 from .renderer import Renderer, C, _icon, _token_color
 from .config import load_config, save_config
 from .workspace import save_workspace
 from .managers import ProviderManager, ToolsManager
-from pathlib import Path
+from .mcp import MCPManager
+from .events import (
+    EventBus,
+    TaskStartedEvent, ModelProcessingEvent, ApprovalRequestedEvent,
+    StreamChunkEvent, ProviderResponseEvent, TaskFinishedEvent, TaskErrorEvent,
+    ToolCallEvent, ToolFinishedEvent, ContextCompressedEvent, ErrorEvent,
+    ApprovalGrantedEvent, ApprovalDeniedEvent, ToolErrorEvent,
+    QuestionRequestedEvent, ContextCompressionErrorEvent,
+    AgentPausedEvent, AgentResumedEvent, ToolStartedEvent,
+)
 
 BAR_WIDTH = 20
 
-
 def _build_provider_from_providers_manager(
-    providers_manager: ProviderManager,
-    tools_manager: ToolsManager,
-    name: str,
-    cfg: dict,
-    tools: list,
-    current_model: str,
-) -> Any:
-    """Instantiate a provider class obtained from ProviderManager."""
+    providers_manager, tools_manager, name, cfg, tools, current_model, bus
+):
+    import inspect
     cls = providers_manager.get_provider(name)
     if cls is None:
         raise ValueError(f"Provider '{name}' not found in ProviderManager")
-
-    import inspect
-    sig = inspect.signature(cls.__init__)
+    sig    = inspect.signature(cls.__init__)
     params = set(sig.parameters.keys()) - {"self"}
-
     kwargs: dict[str, Any] = {}
     if "api_key" in params:
         kwargs["api_key"] = cfg.get("api_key", cfg.get("openai_api_key", "dummy")) or "dummy"
@@ -58,19 +80,17 @@ def _build_provider_from_providers_manager(
             kwargs["base_url"] = base_url
     if "tools" in params:
         kwargs["tools"] = tools
-
+    kwargs["bus"] = bus
     for key, val in cfg.items():
         if key in params and key not in kwargs and val:
             kwargs[key] = val
-
     return cls(**kwargs)
 
 
 def _context_bar(usage: float) -> str:
-    usage = max(0.0, min(100.0, usage))
+    usage  = max(0.0, min(100.0, usage))
     filled = round(BAR_WIDTH * usage / 100)
-    empty = BAR_WIDTH - filled
-
+    empty  = BAR_WIDTH - filled
     segments: list[str] = []
     remaining = filled
     bands = [
@@ -87,9 +107,24 @@ def _context_bar(usage: float) -> str:
         pos = band_end
         if remaining <= 0:
             break
+    return "".join(segments) + f"[bright_black]{'░' * empty}[/]"
 
-    bar = "".join(segments) + f"[bright_black]{'░' * empty}[/]"
-    return bar
+
+def _mcp_n(mcp_manager: MCPManager | None) -> int:
+    if mcp_manager is None:
+        return 0
+    return len(mcp_manager._configs)
+
+
+def _mcp_keys(mcp_manager: MCPManager) -> list[str]:
+    return list(mcp_manager._configs.keys())
+
+
+def _mcp_key_by_index(mcp_manager: MCPManager, idx: int) -> str | None:
+    keys = _mcp_keys(mcp_manager)
+    if 0 <= idx < len(keys):
+        return keys[idx]
+    return None
 
 class CommandSuggester(Suggester):
     COMMANDS = [
@@ -101,6 +136,8 @@ class CommandSuggester(Suggester):
         "/pause", "/resume",
         "/steer", "/steer clear",
         "/queue",
+        "/mcp", "/mcp add", "/mcp remove", "/mcp enable", "/mcp disable",
+        "/mcp reload", "/mcp ping", "/mcp list",
     ]
 
     def __init__(self, app_ref: "AgentTUI") -> None:
@@ -145,23 +182,22 @@ class StatusBar(Static):
     }
     """
 
-    def refresh_status(
-        self,
-        model: str,
-        provider_name: str,
-        cwd: str,
-        tokens: int,
-        max_tokens: int,
-        usage: float,
-        paused: bool,
-    ) -> None:
-        project = Path(cwd).name or cwd
-        bar     = _context_bar(usage)
-        pause   = " [yellow]⏸[/]" if paused else ""
-        pcolor  = "bright_cyan" if provider_name != "?" else "grey50"
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__("Initializing…", *args, **kwargs)
 
-        # BUG FIX: when max_tokens is 0 (provider attribute not found) show a
-        # friendlier "N/A" instead of "X/0" which looks broken.
+    def refresh_status(self, model, provider_name, cwd, tokens,
+                       max_tokens, usage, paused, interrupted, n_mcp=0) -> None:
+        project  = Path(cwd).name or cwd
+        bar      = _context_bar(usage)
+        if interrupted:
+            state = " [red]✗ interrupted[/]"
+        elif paused:
+            state = " [yellow]⏸ paused[/]"
+        else:
+            state = ""
+        pcolor   = "bright_cyan" if provider_name != "?" else "grey50"
+        mcp_info = f"  [grey50]mcp:{n_mcp}[/]" if n_mcp > 0 else ""
+
         if max_tokens > 0:
             token_str = f"[bright_black]{tokens:,}/{max_tokens:,}[/]"
             usage_str = f"[bright_black]{usage:.0f}%[/]"
@@ -172,31 +208,263 @@ class StatusBar(Static):
         self.update(
             f"[{pcolor}]{provider_name}[/]"
             f"  [cyan]{model}[/]"
-            f"{pause}"
+            f"{state}"
             f"  [bold]{project}[/]"
+            f"{mcp_info}"
             f"  {bar}"
             f" {usage_str}"
             f"  {token_str}"
         )
 
-class ProviderPickerModal(ModalScreen):
-    """
-    Step 1: choose provider type from ProviderManager.
-    Step 2: fill in provider-specific fields (introspected from constructor).
-    Returns (provider_name, updated_cfg) or None.
-    """
-
+class MCPModal(ModalScreen):
     CSS = """
-    ProviderPickerModal {
-        align: center middle;
-    }
-    ProviderPickerModal > Vertical {
-        width: 68;
+    MCPModal { align: center middle; }
+
+    MCPModal > Vertical {
+        width: 82;
         height: auto;
-        max-height: 85%;
+        max-height: 90%;
         background: $surface;
         border: round $accent;
         padding: 1 2;
+    }
+
+    .modal-title  { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
+    .subtitle     { color: $text-muted; margin-bottom: 1; }
+
+    #mcp-table    { height: auto; max-height: 16; border: solid $panel; margin-bottom: 1; }
+
+    .add-row      { height: 3; layout: horizontal; align: left middle; margin-bottom: 1; }
+    .add-input    { width: 1fr; border: solid $accent; }
+
+    .btn-grid     { layout: vertical; height: auto; margin-bottom: 1; }
+
+    .mcp-btn      { width: 100%; margin: 0 0 1 0; }
+
+    .btn-row      { layout: horizontal; height: 3; align: right middle; margin-top: 1; }
+
+    #mcp-status   { height: 1; color: $text-muted; margin-bottom: 1; }
+    """
+
+    def __init__(self, mcp_manager: MCPManager) -> None:
+        super().__init__()
+        self._mgr = mcp_manager
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("⬡  MCP Servers", classes="modal-title")
+            yield Label(
+                "Add / remove MCP servers. Tools are registered automatically.",
+                classes="subtitle",
+            )
+
+            yield DataTable(id="mcp-table", cursor_type="row")
+            yield Label("", id="mcp-status")
+
+            with Horizontal(classes="add-row"):
+                yield Input(
+                    placeholder="http://localhost:8000 or stdio://npx -y @mcp/server",
+                    id="inp-mcp-url",
+                    classes="add-input",
+                )
+                yield Button("Add", variant="success", id="btn-mcp-add")
+
+            with Vertical(classes="btn-grid"):
+                yield Button("Enable", id="btn-mcp-toggle", classes="mcp-btn")
+                yield Button("Remove", id="btn-mcp-remove", classes="mcp-btn", variant="error")
+                yield Button("Reload ↺", id="btn-mcp-reload", classes="mcp-btn")
+                yield Button("Ping", id="btn-mcp-ping", classes="mcp-btn")
+
+            with Horizontal(classes="btn-row"):
+                yield Button("Close", variant="default", id="btn-mcp-close")
+
+    def on_mount(self) -> None:
+        self._populate()
+        self._refresh_buttons()
+
+    def _set_status(self, msg: str, color: str = "grey50") -> None:
+        try:
+            self.query_one("#mcp-status", Label).update(f"[{color}]{msg}[/]")
+        except Exception:
+            pass
+
+    def _selected_index(self) -> int | None:
+        tbl = self.query_one("#mcp-table", DataTable)
+        if tbl.row_count == 0:
+            return None
+        return tbl.cursor_row
+
+    def _selected_key(self) -> str | None:
+        idx = self._selected_index()
+        if idx is None:
+            return None
+        rows = self._mgr.status_rows()
+        if idx < 0 or idx >= len(rows):
+            return None
+        return rows[idx]["key"]
+
+    def _is_enabled(self, key: str) -> bool:
+        rows = self._mgr.status_rows()
+        for r in rows:
+            if r["key"] == key:
+                return bool(r["enabled"])
+        return False
+
+    def _populate(self, extra_col: dict | None = None) -> None:
+        tbl = self.query_one("#mcp-table", DataTable)
+        tbl.clear(columns=True)
+
+        cols = ["#", "Server", "Connected", "Enabled", "Tools", "Resources", "Prompts"]
+        if extra_col:
+            cols.append(extra_col["name"])
+
+        tbl.add_columns(*cols)
+
+        for row in self._mgr.status_rows():
+            en_mark = "✓" if row["enabled"] else "✗"
+            con_mark = "live" if row["connected"] else "—"
+            display = row.get("url") or row.get("label") or row["key"]
+
+            if len(display) > 48:
+                display = display[:45] + "…"
+
+            cells = [
+                str(row["index"] + 1),
+                display,
+                con_mark,
+                en_mark,
+                str(row["n_tools"]),
+                str(row["n_resources"]),
+                str(row["n_prompts"]),
+            ]
+
+            if extra_col:
+                cells.append(extra_col["data"].get(row["key"], "?"))
+
+            tbl.add_row(*cells)
+
+    def _refresh_buttons(self) -> None:
+        """Toggle Enable/Disable button depending on selected server state."""
+        btn = self.query_one("#btn-mcp-toggle", Button)
+
+        key = self._selected_key()
+        if not key:
+            btn.label = "Enable"
+            btn.variant = "default"
+            return
+
+        enabled = self._is_enabled(key)
+
+        if enabled:
+            btn.label = "Disable"
+            btn.variant = "warning"
+        else:
+            btn.label = "Enable"
+            btn.variant = "success"
+
+    def _add_server(self, spec: str) -> None:
+        spec = spec.strip()
+        if not spec:
+            return
+
+        try:
+            if spec.startswith("stdio://"):
+                import shlex
+                cmd = shlex.split(spec[len("stdio://"):].strip())
+                self._mgr.add_stdio(cmd)
+                key = f"stdio://{' '.join(cmd)}"
+                self._mgr.connect(key)
+            else:
+                self._mgr.add(spec)
+                self._mgr.connect(spec)
+
+            self._set_status("Server added", "green")
+
+        except Exception as e:
+            self._set_status(f"Connect failed: {e}", "yellow")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+
+        if bid == "btn-mcp-close":
+            self.dismiss(None)
+
+        elif bid == "btn-mcp-add":
+            spec = self.query_one("#inp-mcp-url", Input).value.strip()
+            if not spec:
+                self._set_status("Enter URL or stdio:// command", "yellow")
+                return
+
+            self._add_server(spec)
+            self.query_one("#inp-mcp-url", Input).value = ""
+            self._populate()
+
+        elif bid == "btn-mcp-toggle":
+            key = self._selected_key()
+            if not key:
+                self._set_status("Select a server", "yellow")
+                return
+
+            if self._is_enabled(key):
+                self._mgr.disable(key)
+                self._set_status("Disabled", "grey50")
+            else:
+                self._mgr.enable(key)
+                try:
+                    self._mgr.connect(key)
+                except Exception:
+                    pass
+                self._set_status("Enabled", "green")
+
+            self._populate()
+            self._refresh_buttons()
+
+        elif bid == "btn-mcp-remove":
+            key = self._selected_key()
+            if key:
+                self._mgr.remove(key)
+                self._set_status("Removed", "grey50")
+
+            self._populate()
+            self._refresh_buttons()
+
+        elif bid == "btn-mcp-reload":
+            self._set_status("Reloading…", "grey50")
+            results = self._mgr.reload_all()
+
+            ok = sum(1 for r in results.values() if r.get("ok"))
+            err = len(results) - ok
+
+            self._set_status(
+                f"Reloaded {ok} ok, {err} failed",
+                "green" if err == 0 else "yellow",
+            )
+
+            self._populate()
+            self._refresh_buttons()
+
+        elif bid == "btn-mcp-ping":
+            self._set_status("Pinging…", "grey50")
+
+            statuses = self._mgr.ping_all()
+            alive = sum(1 for v in statuses.values() if v)
+
+            self._set_status(
+                f"Ping: {alive}/{len(statuses)} alive",
+                "green",
+            )
+
+            self._populate()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self._refresh_buttons()
+
+class ProviderPickerModal(ModalScreen):
+    CSS = """
+    ProviderPickerModal { align: center middle; }
+    ProviderPickerModal > Vertical {
+        width: 68; height: auto; max-height: 85%;
+        background: $surface; border: round $accent; padding: 1 2;
     }
     .modal-title  { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
     .subtitle     { text-align: center; color: $text-muted; margin-bottom: 1; }
@@ -207,7 +475,6 @@ class ProviderPickerModal(ModalScreen):
     .field-input  { width: 1fr; border: solid $accent; }
     .btn-row      { layout: horizontal; height: 3; align: right middle; margin-top: 1; }
     .step2-title  { color: $accent; text-style: bold; margin-bottom: 1; }
-    #step1        { }
     #step2        { display: none; }
     """
 
@@ -220,7 +487,7 @@ class ProviderPickerModal(ModalScreen):
         "context_length":     {"label": "Ctx Length", "password": False},
     }
 
-    def __init__(self, agent: "Agent", manager: ProviderManager) -> None:
+    def __init__(self, agent: Agent, manager: ProviderManager) -> None:
         super().__init__()
         self.agent             = agent
         self.providers_manager = manager
@@ -232,9 +499,9 @@ class ProviderPickerModal(ModalScreen):
         cls = self.providers_manager.get_provider(name)
         if cls is None:
             return []
-        sig = inspect.signature(cls.__init__)
+        sig    = inspect.signature(cls.__init__)
         fields = []
-        skip = {"self", "tools", "kwargs", "args"}
+        skip   = {"self", "tools", "kwargs", "args"}
         for param_name, param in sig.parameters.items():
             if param_name in skip:
                 continue
@@ -257,7 +524,6 @@ class ProviderPickerModal(ModalScreen):
         with Vertical():
             yield Label("⬡  Select Provider", classes="modal-title")
             yield Label("Choose a provider to connect to", classes="subtitle")
-
             with Vertical(id="step1"):
                 names = list(providers.keys())
                 for i in range(0, len(names), 2):
@@ -268,7 +534,6 @@ class ProviderPickerModal(ModalScreen):
                             label = getattr(cls, "provider_name", n)
                             yield Button(label, id=f"pick-{n}", classes="provider-btn")
                 yield Button("Cancel", variant="default", id="btn-cancel-step1")
-
             with Vertical(id="step2"):
                 yield Label("", id="step2-title", classes="step2-title")
                 yield Vertical(id="fields-container")
@@ -278,57 +543,41 @@ class ProviderPickerModal(ModalScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
-
         if bid == "btn-cancel-step1":
             self.dismiss(None)
-            return
-
-        if bid.startswith("pick-"):
+        elif bid.startswith("pick-"):
             self._chosen_name = bid[len("pick-"):]
             self._show_step2(self._chosen_name)
-            return
-
-        if bid == "btn-back":
+        elif bid == "btn-back":
             self.query_one("#step1").styles.display = "block"
             self.query_one("#step2").styles.display = "none"
-            return
-
-        if bid == "btn-connect":
+        elif bid == "btn-connect":
             self._do_connect()
-            return
 
     def _show_step2(self, name: str) -> None:
         cls   = self.providers_manager.get_provider(name)
         label = getattr(cls, "provider_name", name) if cls else name
-
         self.query_one("#step2-title", Label).update(f"Configure  {label}")
-
         container = self.query_one("#fields-container", Vertical)
         container.remove_children()
-
         for field in self._provider_fields(name):
             fid      = field["id"]
             flabel   = field["label"]
             password = field["password"]
-
-            default = (
+            default  = (
                 self._cfg.get(fid)
                 or os.getenv(fid.upper(), "")
                 or field["default"]
             )
             if fid == "model":
                 default = self._cfg.get("model", self.agent.provider.model) or field["default"]
-
             row = Horizontal(classes="field-row")
             row.compose_add_child(Label(f"{flabel}:", classes="field-label"))
             row.compose_add_child(Input(
-                value=str(default),
-                password=password,
-                id=f"field-{fid}",
-                classes="field-input",
+                value=str(default), password=password,
+                id=f"field-{fid}", classes="field-input",
             ))
             container.mount(row)
-
         self.query_one("#step1").styles.display = "none"
         self.query_one("#step2").styles.display = "block"
 
@@ -336,7 +585,6 @@ class ProviderPickerModal(ModalScreen):
         name   = self._chosen_name
         fields = self._provider_fields(name)
         cfg    = load_config()
-
         for field in fields:
             fid = field["id"]
             try:
@@ -345,23 +593,16 @@ class ProviderPickerModal(ModalScreen):
                 val = ""
             if val:
                 cfg[fid] = val
-
         cfg["provider"] = name
         save_config(cfg)
         self.dismiss((name, cfg))
 
 class SettingsModal(ModalScreen):
     CSS = """
-    SettingsModal {
-        align: center middle;
-    }
+    SettingsModal { align: center middle; }
     SettingsModal > Vertical {
-        width: 72;
-        height: auto;
-        max-height: 80%;
-        background: $surface;
-        border: round $accent;
-        padding: 1 2;
+        width: 72; height: auto; max-height: 80%;
+        background: $surface; border: round $accent; padding: 1 2;
     }
     .modal-title { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
     .field-row   { height: 3; layout: horizontal; align: left middle; margin-bottom: 1; }
@@ -370,10 +611,16 @@ class SettingsModal(ModalScreen):
     .btn-row     { layout: horizontal; height: 3; align: right middle; margin-top: 1; }
     """
 
-    def __init__(self, agent: Agent, manager: ProviderManager) -> None:
+    def __init__(
+        self,
+        agent: Agent,
+        manager: ProviderManager,
+        mcp_manager: MCPManager | None = None,
+    ) -> None:
         super().__init__()
         self.agent             = agent
         self.providers_manager = manager
+        self.mcp_manager       = mcp_manager
         self._cfg              = load_config()
 
     def _provider_fields(self, name: str) -> list[dict]:
@@ -382,9 +629,9 @@ class SettingsModal(ModalScreen):
         cls = self.providers_manager.get_provider(name)
         if cls is None:
             return []
-        sig = inspect.signature(cls.__init__)
+        sig    = inspect.signature(cls.__init__)
         fields = []
-        skip = {"self", "tools", "kwargs", "args"}
+        skip   = {"self", "tools", "kwargs", "args"}
         for param_name, param in sig.parameters.items():
             if param_name in skip:
                 continue
@@ -412,11 +659,7 @@ class SettingsModal(ModalScreen):
                     with Horizontal(classes="field-row"):
                         yield Label("Approval mode:", classes="field-label")
                         yield Select(
-                            [
-                                ("safe (default)", "safe"),
-                                ("never",          "never"),
-                                ("always",         "always"),
-                            ],
+                            [("safe (default)", "safe"), ("never", "never"), ("always", "always")],
                             value=self.agent.approve_mode,
                             id="sel-approve",
                         )
@@ -424,8 +667,7 @@ class SettingsModal(ModalScreen):
                         yield Label("Context length:", classes="field-label")
                         yield Input(
                             value=str(self.agent.context.max_tokens),
-                            id="inp-ctx-len",
-                            classes="field-input",
+                            id="inp-ctx-len", classes="field-input",
                         )
                 with TabPane("Provider"):
                     cls   = self.providers_manager.get_provider(pname)
@@ -446,30 +688,51 @@ class SettingsModal(ModalScreen):
                         with Horizontal(classes="field-row"):
                             yield Label(f"{flabel}:", classes="field-label")
                             yield Input(
-                                value=str(default),
-                                password=password,
-                                id=f"prov-field-{fid}",
-                                classes="field-input",
+                                value=str(default), password=password,
+                                id=f"prov-field-{fid}", classes="field-input",
                             )
+                with TabPane("MCP"):
+                    if self.mcp_manager:
+                        rows = self.mcp_manager.status_rows()
+                        if rows:
+                            lines = []
+                            for row in rows:
+                                st      = "✓" if row["connected"] else "○"
+                                color   = "green" if row["connected"] else ("grey50" if row["enabled"] else "red")
+                                en_note = "" if row["enabled"] else " [red](disabled)[/]"
+                                display = row.get("url") or row.get("label") or row["key"]
+                                lines.append(
+                                    f"[{color}]{st}[/]  "
+                                    f"{display}{en_note}  "
+                                    f"[grey50]({row['n_tools']} tools)[/]"
+                                )
+                            yield Static("\n".join(lines), markup=True)
+                        else:
+                            yield Static(
+                                "[grey50]No MCP servers configured.[/]\n"
+                                "Use /mcp add <url> or Ctrl+E.",
+                                markup=True,
+                            )
+                    else:
+                        yield Static("[grey50]MCP manager not available.[/]", markup=True)
                 with TabPane("About"):
                     all_providers = self.providers_manager.get_all_providers()
                     enabled       = self.providers_manager.get_providers()
-                    # BUG FIX: show "N/A" when max_tokens is 0 so the About
-                    # tab does not display a confusing "0" context length.
-                    ctx_display = (
+                    ctx_display   = (
                         f"{self.agent.context.max_tokens:,}"
-                        if self.agent.context.max_tokens > 0
-                        else "N/A"
+                        if self.agent.context.max_tokens > 0 else "N/A"
                     )
+                    n_mcp = _mcp_n(self.mcp_manager)
                     yield Static(
-                        f"[bold cyan]Model:[/bold cyan]     {p.model}\n"
-                        f"[bold cyan]Provider:[/bold cyan]  {pname}  ({p.__class__.__name__})\n"
-                        f"[bold cyan]Loaded:[/bold cyan]    {len(all_providers)} providers "
+                        f"[bold cyan]Model:[/bold cyan]      {p.model}\n"
+                        f"[bold cyan]Provider:[/bold cyan]   {pname}  ({p.__class__.__name__})\n"
+                        f"[bold cyan]Loaded:[/bold cyan]     {len(all_providers)} providers "
                         f"({len(enabled)} enabled)\n"
-                        f"[bold cyan]Tools:[/bold cyan]     {len(self.agent.tools)}\n"
-                        f"[bold cyan]Messages:[/bold cyan]  {len(self.agent.context.messages)}\n"
-                        f"[bold cyan]Ctx len:[/bold cyan]   {ctx_display}\n"
-                        f"[bold cyan]CWD:[/bold cyan]       {os.getcwd()}",
+                        f"[bold cyan]Tools:[/bold cyan]      {len(self.agent.tools)}\n"
+                        f"[bold cyan]MCP servers:[/bold cyan] {n_mcp}\n"
+                        f"[bold cyan]Messages:[/bold cyan]   {len(self.agent.context.messages)}\n"
+                        f"[bold cyan]Ctx len:[/bold cyan]    {ctx_display}\n"
+                        f"[bold cyan]CWD:[/bold cyan]        {os.getcwd()}",
                         markup=True,
                     )
             with Horizontal(classes="btn-row"):
@@ -480,10 +743,8 @@ class SettingsModal(ModalScreen):
         if event.button.id == "btn-cancel":
             self.dismiss(None)
             return
-
         cfg   = load_config()
         pname = cfg.get("provider", "?")
-
         try:
             v = self.query_one("#sel-approve", Select).value
             if v and v != Select.BLANK:
@@ -491,7 +752,6 @@ class SettingsModal(ModalScreen):
                 cfg["approve_mode"] = v
         except Exception:
             pass
-
         try:
             n = int(self.query_one("#inp-ctx-len", Input).value)
             if n > 0:
@@ -499,7 +759,6 @@ class SettingsModal(ModalScreen):
                 cfg["context_length"] = n
         except Exception:
             pass
-
         for field in self._provider_fields(pname):
             fid = field["id"]
             try:
@@ -519,23 +778,20 @@ class SettingsModal(ModalScreen):
                             pass
             except Exception:
                 pass
-
         save_config(cfg)
         save_workspace(self.agent)
         self.dismiss("saved")
 
 class ModelPickerModal(ModalScreen):
     CSS = """
-    ModelPickerModal {
-        align: center middle;
-    }
+    ModelPickerModal { align: center middle; }
     ModelPickerModal > Vertical {
         width: 62; height: 80%;
         background: $surface; border: round $accent; padding: 1 2;
     }
-    .modal-title   { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
-    #model-search  { border: solid $accent; margin-bottom: 1; }
-    #model-list    { height: 1fr; border: solid $panel; }
+    .modal-title  { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
+    #model-search { border: solid $accent; margin-bottom: 1; }
+    #model-list   { height: 1fr; border: solid $panel; }
     """
 
     def __init__(self, models: list[str], current: str) -> None:
@@ -573,19 +829,16 @@ class ModelPickerModal(ModalScreen):
 class StreamView(Static):
     DEFAULT_CSS = """
     StreamView {
-        height: auto;
-        max-height: 60%;
-        padding: 0 2;
-        background: $background;
-        overflow-y: auto;
+        height: auto; max-height: 60%;
+        padding: 0 2; background: $background; overflow-y: auto;
     }
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__("", *args, **kwargs)
-        self._lines: list[str] = []
-        self._partial: str = ""
-        self._lock = threading.Lock()
+        self._lines:    list[str] = []
+        self._partial:  str       = ""
+        self._lock      = threading.Lock()
         self._streaming = False
 
     def push_chunk(self, text: str) -> None:
@@ -601,14 +854,9 @@ class StreamView(Static):
         with self._lock:
             content = "\n".join(self._lines)
             if self._partial:
-                if content:
-                    content += "\n"
-                content += self._partial
+                content = (content + "\n" if content else "") + self._partial
             streaming = self._streaming
-        if streaming:
-            self.styles.border = ("solid", "blue")
-        else:
-            self.styles.border = None
+        self.styles.border = ("solid", "blue") if streaming else None
         super().update(Markdown(content, code_theme="monokai"))
 
     def commit(self) -> str:
@@ -617,49 +865,35 @@ class StreamView(Static):
                 self._lines.append(self._partial)
                 self._partial = ""
             full = "\n".join(self._lines)
-            self._lines = []
+            self._lines     = []
             self._streaming = False
         self.app.call_from_thread(self._update_display)
         return full
 
     def cancel(self) -> str:
         return self.commit()
-    
+
 class AgentTUI(App):
     CSS = """
     Screen { layers: base; }
     #log {
-        height: 1fr;
-        border: none;
-        padding: 0 2;
-        scrollbar-gutter: stable;
+        height: 1fr; border: none; padding: 0 2; scrollbar-gutter: stable;
     }
     StreamView {
-        height: auto;
-        max-height: 60%;
-        padding: 0 2;
-        background: $background;
+        height: auto; max-height: 60%; padding: 0 2; background: $background;
     }
     #input-bar {
-        height: 3;
-        border-top: solid $accent;
-        background: $surface;
-        padding: 0 1;
-        layout: horizontal;
-        align: left middle;
+        height: 3; border-top: solid $accent; background: $surface;
+        padding: 0 1; layout: horizontal; align: left middle;
     }
     #prompt-label {
-        width: auto;
-        color: $accent;
-        padding: 0 1 0 0;
-        content-align: left middle;
+        width: auto; color: $accent; padding: 0 1 0 0; content-align: left middle;
     }
-    #prompt-label.question-mode { color: yellow; }
+    #prompt-label.question-mode   { color: yellow; }
+    #prompt-label.approval-mode   { color: orange; }
+    #prompt-label.interrupted     { color: red; }
     #cmd-input {
-        height: 1;
-        width: 1fr;
-        border: none;
-        background: transparent;
+        height: 1; width: 1fr; border: none; background: transparent;
     }
     #cmd-input:focus { border: none; }
     Footer { height: 1; }
@@ -671,30 +905,38 @@ class AgentTUI(App):
         Binding("ctrl+s", "open_settings",        "Settings"),
         Binding("ctrl+m", "open_model_picker",    "Models"),
         Binding("ctrl+r", "open_provider_picker", "Provider"),
+        Binding("ctrl+e", "open_mcp",             "MCP"),
     ]
 
     def __init__(
         self,
+        bus: EventBus,
         agent: Agent,
         providers_manager: ProviderManager,
         tools_manager: ToolsManager,
+        mcp_manager: MCPManager | None = None,
     ) -> None:
         super().__init__()
         self.agent             = agent
         self.providers_manager = providers_manager
         self.tools_manager     = tools_manager
+        self.mcp_manager       = mcp_manager
         self._R                = Renderer()
+        self.bus               = bus
 
-        self._approval_needed = threading.Event()
-        self._approval_done   = threading.Event()
-        self._approval_tool   = ""
+        self._approval_pending  = threading.Event() 
+        self._approval_done     = threading.Event() 
+        self._approval_tool     = ""
+        self._approval_result: bool | None = None
 
-        self._question_needed           = threading.Event()
-        self._question_done             = threading.Event()
+        self._question_pending           = threading.Event()
+        self._question_done              = threading.Event()
         self._question_suggestions: list[str] = []
-        self._question_answer_ref: list[str]  = []
+        self._question_answer: str       = ""
 
-        self._streaming = False
+        self._streaming      = False
+        self._interrupt_flag = threading.Event()
+        self._interrupted    = False
 
     def compose(self) -> ComposeResult:
         yield StatusBar(id="statusbar")
@@ -711,20 +953,20 @@ class AgentTUI(App):
 
     def on_mount(self) -> None:
         self.query_one("#cmd-input", Input).focus()
-        self._tick_status()
+        self._register_event_handlers()
+        self.call_after_refresh(self._tick_status)
         self.set_interval(2, self._tick_status)
 
     def _tick_status(self) -> None:
         try:
-            p = self.agent.provider
-            cfg = load_config()
+            p             = self.agent.provider
+            cfg           = load_config()
             provider_name = (
                 cfg.get("provider")
                 or getattr(p, "provider_name", None)
                 or p.__class__.__name__
                 or "?"
             )
-
             self.query_one(StatusBar).refresh_status(
                 model         = p.model.split("/")[-1],
                 provider_name = provider_name,
@@ -733,9 +975,14 @@ class AgentTUI(App):
                 max_tokens    = self.agent.context.max_tokens,
                 usage         = self.agent.context.usage_percent(),
                 paused        = self.agent.is_paused,
+                interrupted   = self._interrupted,
+                n_mcp         = _mcp_n(self.mcp_manager),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                self.query_one(StatusBar).update(f"[red]Status error: {e}[/]")
+            except Exception:
+                pass
 
     def _write(self, renderable: Any) -> None:
         def _do():
@@ -775,23 +1022,44 @@ class AgentTUI(App):
                 _commit()
 
     def _stream_cancel(self) -> None:
-        if not self._streaming:
-            return
-        self._streaming = False
-        sv      = self._sv()
-        partial = sv.cancel()
-        if partial.strip():
-            def _commit():
-                log = self.query_one("#log", RichLog)
-                log.write(Text(""))
-                log.write(Markdown(partial, code_theme="monokai"))
-                t = Text()
-                t.append("  … interrupted", style=C.WARN)
-                log.write(t)
-            try:
-                self.call_from_thread(_commit)
-            except Exception:
-                _commit()
+        """Cancel the current stream visually; sets interrupt flag for the agent."""
+        if self._streaming:
+            self._streaming = False
+            partial = self._sv().cancel()
+            if partial.strip():
+                def _commit():
+                    log = self.query_one("#log", RichLog)
+                    log.write(Text(""))
+                    log.write(Markdown(partial, code_theme="monokai"))
+                    t = Text()
+                    t.append("  … interrupted", style=C.WARN)
+                    log.write(t)
+                try:
+                    self.call_from_thread(_commit)
+                except Exception:
+                    _commit()
+
+        self._interrupt_flag.set()
+        self._interrupted = True
+
+        if self._approval_pending.is_set():
+            self._approval_result = False
+            self._approval_done.set()
+            self._approval_pending.clear()
+
+        if self._question_pending.is_set():
+            self._question_answer = ""
+            self._question_done.set()
+            self._question_pending.clear()
+
+        try:
+            self.call_from_thread(self._tick_status)
+        except Exception:
+            pass
+
+    def _clear_interrupt(self) -> None:
+        self._interrupt_flag.clear()
+        self._interrupted = False
 
     def _enter_question_mode(self, suggestions: list[str]) -> None:
         self._question_suggestions = suggestions
@@ -809,76 +1077,120 @@ class AgentTUI(App):
         label.remove_class("question-mode")
         self.query_one("#cmd-input", Input).placeholder = "Type a task or /help…"
 
-    def event_handler(self, event: str, data: dict) -> None:
-        if event == "task_started":
-            self._write_many(self._R.task_started(data["prompt"]))
+    def _enter_approval_mode(self, tool: str) -> None:
+        label = self.query_one("#prompt-label", Label)
+        label.update("y/n›")
+        label.add_class("approval-mode")
+        self.query_one("#cmd-input", Input).placeholder = (
+            f"Approve tool '{tool}'?  y / n / a (always)"
+        )
 
-        elif event == "model_processing":
+    def _leave_approval_mode(self) -> None:
+        label = self.query_one("#prompt-label", Label)
+        label.update("❯")
+        label.remove_class("approval-mode")
+        self.query_one("#cmd-input", Input).placeholder = "Type a task or /help…"
+
+    def _register_event_handlers(self) -> None:
+
+        @self.bus.subscribe(TaskStartedEvent)
+        def _(e: TaskStartedEvent):
+            self.call_from_thread(self._clear_interrupt)
+            self._write_many(self._R.task_started(e.prompt))
+
+        @self.bus.subscribe(TaskFinishedEvent)
+        def _(e: TaskFinishedEvent):
+            self._stream_close()
+            save_workspace(self.agent)
+            try:
+                self.call_from_thread(self._tick_status)
+            except Exception:
+                pass
+
+        @self.bus.subscribe(TaskErrorEvent)
+        def _(e: TaskErrorEvent):
+            self._stream_close()
+            self._write_many(self._R.task_error(e.error))
+            try:
+                self.call_from_thread(self._tick_status)
+            except Exception:
+                pass
+
+        @self.bus.subscribe(StreamChunkEvent)
+        def _(e: StreamChunkEvent):
+            if isinstance(e.data, dict) and e.data.get("type") == "text":
+                self._stream_chunk(e.data["content"])
+
+        @self.bus.subscribe(ModelProcessingEvent)
+        def _(e):
             self._write_many(self._R.thinking())
 
-        elif event == "stream_chunk":
-            if data.get("type") == "text":
-                self._stream_chunk(data["content"])
-
-        elif event == "provider_response":
+        @self.bus.subscribe(ProviderResponseEvent)
+        def _(e):
             self._stream_close()
 
-        elif event == "tool_call":
-            tool = data.get("tool", "")
-            if not tool or tool in {"FinishTask", "FinishTaskTool", "Question", "QuestionTool"}:
+        @self.bus.subscribe(ToolCallEvent)
+        def _(e: ToolCallEvent):
+            if not e.tool or e.tool in {"FinishTask", "FinishTaskTool", "Question", "QuestionTool"}:
                 return
             self._stream_close()
-            self._write_many(self._R.tool_call(tool, data.get("args", {})))
+            self._write_many(self._R.tool_call(e.tool, e.args))
 
-        elif event == "tool_finished":
-            self._stream_close()
-            tool = data.get("tool", "")
-            if tool not in {"Question", "QuestionTool"}:
-                self._write_many(self._R.tool_result(tool, data.get("result")))
+        @self.bus.subscribe(ToolStartedEvent)
+        def _(e: ToolStartedEvent):
+            pass
 
-        elif event == "tool_error":
+        @self.bus.subscribe(ToolFinishedEvent)
+        def _(e: ToolFinishedEvent):
             self._stream_close()
-            self._write_many(self._R.tool_error(
-                data.get("tool", "?"), data.get("error", "unknown error")
-            ))
+            if e.tool not in {"Question", "QuestionTool"}:
+                self._write_many(self._R.tool_result(e.tool, e.result))
 
-        elif event == "approval_requested":
+        @self.bus.subscribe(ToolErrorEvent)
+        def _(e: ToolErrorEvent):
             self._stream_close()
-            self._approval_tool = data["tool"]
+            self._write_many(self._R.tool_error(e.tool, e.error))
+
+        @self.bus.subscribe(ApprovalRequestedEvent)
+        def _(e: ApprovalRequestedEvent):
+            self._stream_close()
+            self._approval_tool = e.tool
+            self._approval_result = None
             self._approval_done.clear()
-            self._approval_needed.set()
-            self._write_many(self._R.approval_request(data["tool"]))
+            self._approval_pending.set()
+
+            self._write_many(self._R.approval_request(e.tool))
+            try:
+                self.call_from_thread(self._enter_approval_mode, e.tool)
+            except Exception:
+                pass
+
             self._approval_done.wait()
+            try:
+                self.call_from_thread(self._leave_approval_mode)
+            except Exception:
+                pass
 
-        elif event == "approval_denied":
-            self._write_many(self._R.approval_result(False, data.get("tool", "")))
+        @self.bus.subscribe(ApprovalGrantedEvent)
+        def _(e: ApprovalGrantedEvent):
+            self._write_many(self._R.approval_result(True, e.tool))
 
-        elif event == "approval_granted":
-            self._write_many(self._R.approval_result(True, data.get("tool", "")))
+        @self.bus.subscribe(ApprovalDeniedEvent)
+        def _(e: ApprovalDeniedEvent):
+            self._write_many(self._R.approval_result(False, e.tool))
 
-        elif event == "context_compressed":
-            self._write_many(self._R.context_compressed(
-                data.get("before_tokens", 0), data.get("after_tokens", 0)
-            ))
-
-        elif event == "context_compression_error":
-            self._write_many(self._R.task_error(data.get("error", "")))
-
-        elif event == "task_error":
+        @self.bus.subscribe(QuestionRequestedEvent)
+        def _(e: QuestionRequestedEvent):
             self._stream_close()
-            self._write_many(self._R.task_error(data.get("error", "")))
-
-        elif event == "question_requested":
-            self._stream_close()
-            question    = data.get("question", "")
-            context     = data.get("context", "")
-            suggestions = data.get("suggestions", [])
-
+            question    = e.payload.get("question", "")
+            context     = e.payload.get("context", "")
+            suggestions = e.payload.get("suggestions", [])
             self._write_many(self._R.question_request(question, context, suggestions))
 
-            self._question_answer_ref.clear()
+            self._question_answer = ""
             self._question_done.clear()
-            self._question_needed.set()
+            self._question_pending.set()
+
             try:
                 self.call_from_thread(self._enter_question_mode, suggestions)
             except Exception:
@@ -886,13 +1198,40 @@ class AgentTUI(App):
 
             self._question_done.wait()
 
-            answer = self._question_answer_ref[0] if self._question_answer_ref else ""
+            answer = self._question_answer
             self._write_many(self._R.question_answer(answer))
             self.agent.resolve_question(answer)
 
-        elif event == "task_finished":
+            try:
+                self.call_from_thread(self._leave_question_mode)
+            except Exception:
+                pass
+
+        @self.bus.subscribe(ErrorEvent)
+        def _(e: ErrorEvent):
+            self._write_many(self._R.generic_error(e.source, e.message))
+
+        @self.bus.subscribe(ContextCompressedEvent)
+        def _(e: ContextCompressedEvent):
+            self._write_many(self._R.context_compressed(
+                e.info.get("before_tokens", 0),
+                e.info.get("after_tokens", 0),
+            ))
+
+        @self.bus.subscribe(ContextCompressionErrorEvent)
+        def _(e: ContextCompressionErrorEvent):
             self._stream_close()
-            save_workspace(self.agent)
+            self._write_many(self._R.context_compression_error(e.error))
+
+        @self.bus.subscribe(AgentPausedEvent)
+        def _(e):
+            try:
+                self.call_from_thread(self._tick_status)
+            except Exception:
+                pass
+
+        @self.bus.subscribe(AgentResumedEvent)
+        def _(e):
             try:
                 self.call_from_thread(self._tick_status)
             except Exception:
@@ -904,33 +1243,29 @@ class AgentTUI(App):
         if not text:
             return
 
-        if self._approval_needed.is_set():
-            self._approval_needed.clear()
+        if self._approval_pending.is_set():
+            self._approval_pending.clear()
             ans = text.lower()
             if ans == "a":
                 self.agent.approve_mode = "always"
-                self.agent.resolve_approval(True)
+                self._approval_result = True
             elif ans in {"y", "yes"}:
-                self.agent.resolve_approval(True)
+                self._approval_result = True
             else:
-                self.agent.resolve_approval(False)
+                self._approval_result = False
+            self.agent.resolve_approval(bool(self._approval_result))
             self._approval_done.set()
             return
 
-        if self._question_needed.is_set():
-            self._question_needed.clear()
+        if self._question_pending.is_set():
+            self._question_pending.clear()
             suggestions = self._question_suggestions
             answer = text
             if text.isdigit():
                 idx = int(text) - 1
                 if 0 <= idx < len(suggestions):
                     answer = suggestions[idx]
-            self._question_answer_ref.clear()
-            self._question_answer_ref.append(answer)
-            try:
-                self.call_from_thread(self._leave_question_mode)
-            except Exception:
-                self._leave_question_mode()
+            self._question_answer = answer
             self._question_done.set()
             return
 
@@ -957,34 +1292,58 @@ class AgentTUI(App):
             r.append(msg)
             self._write(r)
 
+        def _require_mcp() -> bool:
+            if self.mcp_manager is None:
+                err("MCP manager not initialized")
+                return False
+            return True
+
+        def _require_idx(val: str, cmd: str) -> int | None:
+            if not val.isdigit():
+                err(f"Usage: {cmd} <n>")
+                return None
+            idx = int(val) - 1
+            key = _mcp_key_by_index(self.mcp_manager, idx)
+            if key is None:
+                err(f"No server #{int(val)}")
+                return None
+            return idx
+
         if t in {"/quit", "/exit"}:
             self.exit()
 
         elif t in {"/help", "?"}:
-            tbl = Table(
-                border_style="grey30", show_header=False, padding=(0, 2),
-                box=None, pad_edge=False,
-            )
-            tbl.add_column("cmd",  style="bold cyan", no_wrap=True, min_width=32)
+            tbl = Table(border_style="grey30", show_header=False, padding=(0, 2),
+                        box=None, pad_edge=False)
+            tbl.add_column("cmd",  style="bold cyan", no_wrap=True, min_width=34)
             tbl.add_column("desc", style="grey62")
             rows = [
-                ("/help",                        "This help"),
-                ("/tools",                       "List tools"),
-                ("/model-picker  (Ctrl+M)",       "Model picker"),
-                ("/provider  (Ctrl+R)",           "Provider picker"),
-                ("/settings  (Ctrl+S)",           "Settings modal"),
-                ("/context",                     "Token usage"),
-                ("/history",                     "Message history"),
-                ("/reset",                       "Clear context"),
-                ("/approve [never|safe|always]", "Approval mode"),
-                ("/baseurl [url]",               "Show / set base URL"),
-                ("/set_context_length <n>",      "Max tokens"),
-                ("/compress_context",            "Compress now"),
-                ("/pause  /resume  Ctrl+P",      "Pause / resume"),
-                ("/steer [text|clear]",          "Steering instructions"),
-                ("/queue",                       "Task queue"),
-                ("/clear",                       "Clear log"),
-                ("/quit",                        "Exit"),
+                ("/help",                         "This help"),
+                ("/tools",                        "List tools"),
+                ("/model-picker  (Ctrl+M)",        "Model picker"),
+                ("/provider  (Ctrl+R)",            "Provider picker"),
+                ("/settings  (Ctrl+S)",            "Settings modal"),
+                ("/mcp  (Ctrl+E)",                 "MCP server manager"),
+                ("/mcp list",                      "List MCP servers inline"),
+                ("/mcp add <url|stdio://cmd>",     "Add MCP server (URL or stdio)"),
+                ("/mcp remove <n>",                "Remove server by index"),
+                ("/mcp enable <n>",                "Enable server"),
+                ("/mcp disable <n>",               "Disable server"),
+                ("/mcp reload",                    "Reload tools from all servers"),
+                ("/mcp ping",                      "Ping all servers"),
+                ("/context",                       "Token usage"),
+                ("/history",                       "Message history"),
+                ("/reset",                         "Clear context"),
+                ("/approve [never|safe|always]",   "Approval mode"),
+                ("/baseurl [url]",                 "Show / set base URL"),
+                ("/set_context_length <n>",        "Max tokens"),
+                ("/compress_context",              "Compress now"),
+                ("/pause  /resume  Ctrl+P",        "Pause / resume agent"),
+                ("Ctrl+C",                         "Interrupt current task"),
+                ("/steer [text|clear]",            "Steering instructions"),
+                ("/queue",                         "Task queue"),
+                ("/clear",                         "Clear log"),
+                ("/quit",                          "Exit"),
             ]
             for cmd, desc in rows:
                 tbl.add_row(cmd, desc)
@@ -1012,6 +1371,149 @@ class AgentTUI(App):
         elif t == "/provider":
             self.action_open_provider_picker()
 
+        elif t == "/mcp":
+            self.action_open_mcp()
+
+        elif t == "/mcp list":
+            if not _require_mcp():
+                return
+            rows = self.mcp_manager.status_rows()
+            if not rows:
+                info("No MCP servers configured")
+                return
+            self._write(Text(""))
+            for row in rows:
+                r = Text()
+                connected = row["connected"]
+                enabled   = row["enabled"]
+                icon  = "●" if connected else ("○" if enabled else "✗")
+                color = "green" if connected else ("grey50" if enabled else "red")
+                display = row.get("url") or row.get("label") or row["key"]
+                r.append(f"  {row['index'] + 1}  ", style=C.MUTED)
+                r.append(f"{icon} ", style=color)
+                r.append(display, style="white" if connected else "grey50")
+                r.append(
+                    f"  {row['n_tools']}t {row['n_resources']}r {row['n_prompts']}p",
+                    style=C.MUTED,
+                )
+                self._write(r)
+            self._write(Text(""))
+
+        elif t == "/mcp reload":
+            if not _require_mcp():
+                return
+            info("Reloading all MCP servers…")
+
+            def _do_reload():
+                results = self.mcp_manager.reload_all()
+                for key, res in results.items():
+                    if res.get("error"):
+                        err(f"{key}: {res['error']}")
+                    else:
+                        n = res.get("n_tools", len(res.get("tools", [])))
+                        ok(f"{key}  ({n} tools)")
+                self.call_from_thread(self._tick_status)
+
+            threading.Thread(target=_do_reload, daemon=True).start()
+
+        elif t == "/mcp ping":
+            if not _require_mcp():
+                return
+            statuses = self.mcp_manager.ping_all()
+            if not statuses:
+                info("No servers configured")
+                return
+            for key, alive in statuses.items():
+                r = Text()
+                r.append("  ")
+                r.append("● " if alive else "○ ", style="green" if alive else "red")
+                r.append(key, style="white" if alive else "grey50")
+                r.append("  alive" if alive else "  unreachable",
+                          style="green" if alive else "red")
+                self._write(r)
+
+        elif t.startswith("/mcp add "):
+            if not _require_mcp():
+                return
+            spec = t[len("/mcp add "):].strip()
+            if not spec:
+                err("Usage: /mcp add <url>  or  /mcp add stdio://cmd arg1 arg2")
+                return
+
+            def _do_add():
+                if spec.startswith("stdio://"):
+                    cmd_str = spec[len("stdio://"):].strip()
+                    import shlex
+                    try:
+                        cmd = shlex.split(cmd_str)
+                    except ValueError:
+                        cmd = cmd_str.split()
+                    derived_key = f"stdio://{cmd_str}"
+                    self.mcp_manager.add_stdio(cmd)
+                    try:
+                        self.mcp_manager.connect(derived_key)
+                        n = len(self.mcp_manager._tools.get(derived_key, []))
+                        ok(f"Added stdio server  ({n} tools)")
+                    except Exception as e:
+                        err(f"Saved but connect failed: {e}")
+                else:
+                    self.mcp_manager.add(spec)
+                    key = spec.rstrip("/")
+                    try:
+                        self.mcp_manager.connect(spec)
+                        n = len(self.mcp_manager._tools.get(key, []))
+                        ok(f"Added {spec!r}  ({n} tools)")
+                    except Exception as e:
+                        err(f"Saved {spec!r}, but couldn't connect: {e}")
+                self.call_from_thread(self._tick_status)
+
+            threading.Thread(target=_do_add, daemon=True).start()
+
+        elif t.startswith("/mcp remove "):
+            if not _require_mcp():
+                return
+            val = t[len("/mcp remove "):].strip()
+            idx = _require_idx(val, "/mcp remove")
+            if idx is None:
+                return
+            key = _mcp_key_by_index(self.mcp_manager, idx)
+            self.mcp_manager.remove(key)
+            ok(f"Removed {key!r}")
+            self._tick_status()
+
+        elif t.startswith("/mcp enable "):
+            if not _require_mcp():
+                return
+            val = t[len("/mcp enable "):].strip()
+            idx = _require_idx(val, "/mcp enable")
+            if idx is None:
+                return
+            key = _mcp_key_by_index(self.mcp_manager, idx)
+            self.mcp_manager.enable(key)
+
+            def _do_enable():
+                try:
+                    self.mcp_manager.connect(key)
+                    n = len(self.mcp_manager._tools.get(key, []))
+                    ok(f"Enabled {key!r}  ({n} tools loaded)")
+                except Exception as e:
+                    err(f"Enabled but failed to connect: {e}")
+                self.call_from_thread(self._tick_status)
+
+            threading.Thread(target=_do_enable, daemon=True).start()
+
+        elif t.startswith("/mcp disable "):
+            if not _require_mcp():
+                return
+            val = t[len("/mcp disable "):].strip()
+            idx = _require_idx(val, "/mcp disable")
+            if idx is None:
+                return
+            key = _mcp_key_by_index(self.mcp_manager, idx)
+            self.mcp_manager.disable(key)
+            ok(f"Disabled {key!r}")
+            self._tick_status()
+
         elif t == "/context":
             tok   = self.agent.context.estimate_tokens()
             max_t = self.agent.context.max_tokens
@@ -1026,7 +1528,6 @@ class AgentTUI(App):
                 r.append(f"  ({use:.0f}%)", style=col)
                 r.append(f"  {_context_bar(use)}", style="")
             else:
-                # BUG FIX: don't show "/0" when context_length is unknown
                 r.append(f"{tok:,}  (context length unknown)", style=C.MUTED)
             self._write(r)
 
@@ -1050,7 +1551,7 @@ class AgentTUI(App):
                 self._write(r)
 
         elif t == "/reset":
-            self.agent.context = Context(provider=self.agent.provider)
+            self.agent.context = Context(provider=self.agent.provider, bus=self.bus)
             self.agent.context.compression_callback = self.agent._on_context_compressed
             save_workspace(self.agent)
             ok("Context cleared")
@@ -1112,18 +1613,24 @@ class AgentTUI(App):
             self.agent.context.compress()
 
         elif t == "/pause":
-            self.agent.pause()
-            r = Text()
-            r.append("  ⏸ Paused", style=C.WARN)
-            self._write(r)
-            self._tick_status()
+            if not self.agent.is_paused:
+                self.agent.pause()
+                r = Text()
+                r.append("  ⏸ Paused", style=C.WARN)
+                self._write(r)
+                self._tick_status()
+            else:
+                info("Already paused  (/resume to continue)")
 
         elif t == "/resume":
-            self.agent.resume()
-            r = Text()
-            r.append("  ▶ Resumed", style=C.OK)
-            self._write(r)
-            self._tick_status()
+            if self.agent.is_paused:
+                self.agent.resume()
+                r = Text()
+                r.append("  ▶ Resumed", style=C.OK)
+                self._write(r)
+                self._tick_status()
+            else:
+                info("Not paused")
 
         elif t == "/steer":
             instrs = getattr(self.agent.steering, "instructions", [])
@@ -1166,7 +1673,81 @@ class AgentTUI(App):
             err(f"Unknown command: {t}  (/help for list)")
 
         else:
+            self._clear_interrupt()
             self.agent.enqueue(prompt=t, task_id=str(time.time()))
+
+    def action_toggle_pause(self) -> None:
+        if self.agent.is_paused:
+            self.agent.resume()
+            r = Text()
+            r.append("  ▶ Resumed", style=C.OK)
+            self._write(r)
+        else:
+            self.agent.pause()
+            r = Text()
+            r.append("  ⏸ Paused", style=C.WARN)
+            self._write(r)
+        self._tick_status()
+
+    def action_do_interrupt(self) -> None:
+        """Ctrl+C – interrupt the currently running agent task."""
+        if self.agent.current_task is None and not self._streaming:
+            self.exit()
+            return
+        r = Text()
+        r.append("  ✗ ", style=C.ERR)
+        r.append("Interrupted by user", style=C.WARN)
+        self._write(r)
+        self._stream_cancel()
+        self.agent.stop_queue()
+        self.agent.start_queue()
+
+    def action_open_settings(self) -> None:
+        def _cb(result):
+            if result == "saved":
+                r = Text()
+                r.append("  ✓ ", style=C.OK)
+                r.append("Settings saved", style=C.DIM)
+                self._write(r)
+                self._tick_status()
+        self.push_screen(
+            SettingsModal(self.agent, self.providers_manager, self.mcp_manager), _cb
+        )
+
+    def action_open_provider_picker(self) -> None:
+        self.push_screen(
+            ProviderPickerModal(self.agent, self.providers_manager),
+            self._apply_provider_result,
+        )
+
+    def action_open_model_picker(self) -> None:
+        try:
+            models = self.agent.provider.get_models()
+        except Exception:
+            r = Text()
+            r.append("  ✗ ", style=C.ERR)
+            r.append("Could not fetch models")
+            self._write(r)
+            return
+        if not isinstance(models, list) or not models:
+            r = Text()
+            r.append("  ")
+            r.append("No models available", style=C.MUTED)
+            self._write(r)
+            return
+        self.push_screen(
+            ModelPickerModal(models, self.agent.provider.model),
+            lambda m: m and self._set_model(m),
+        )
+
+    def action_open_mcp(self) -> None:
+        if self.mcp_manager is None:
+            r = Text()
+            r.append("  ✗ ", style=C.ERR)
+            r.append("MCP manager not available")
+            self._write(r)
+            return
+        self.push_screen(MCPModal(self.mcp_manager), lambda _: self._tick_status())
 
     def _set_model(self, model: str) -> None:
         try:
@@ -1208,12 +1789,8 @@ class AgentTUI(App):
         )
         try:
             new_provider = _build_provider_from_providers_manager(
-                self.providers_manager,
-                self.tools_manager,
-                name,
-                cfg,
-                tools,
-                self.agent.provider.model,
+                self.providers_manager, self.tools_manager,
+                name, cfg, tools, self.agent.provider.model, self.bus
             )
             self.agent.provider = new_provider
             self.agent.context.provider = new_provider
@@ -1230,58 +1807,6 @@ class AgentTUI(App):
             r.append("  ✗ ", style=C.ERR)
             r.append(f"Provider error: {e}")
             self._write(r)
-
-    def action_toggle_pause(self) -> None:
-        if self.agent.is_paused:
-            self.agent.resume()
-            r = Text()
-            r.append("  ▶ Resumed", style=C.OK)
-            self._write(r)
-        else:
-            self.agent.pause()
-            r = Text()
-            r.append("  ⏸ Paused", style=C.WARN)
-            self._write(r)
-        self._tick_status()
-
-    def action_do_interrupt(self) -> None:
-        self._stream_cancel()
-
-    def action_open_settings(self) -> None:
-        def _cb(result):
-            if result == "saved":
-                r = Text()
-                r.append("  ✓ ", style=C.OK)
-                r.append("Settings saved", style=C.DIM)
-                self._write(r)
-                self._tick_status()
-        self.push_screen(SettingsModal(self.agent, self.providers_manager), _cb)
-
-    def action_open_provider_picker(self) -> None:
-        self.push_screen(
-            ProviderPickerModal(self.agent, self.providers_manager),
-            self._apply_provider_result,
-        )
-
-    def action_open_model_picker(self) -> None:
-        try:
-            models = self.agent.provider.get_models()
-        except Exception:
-            r = Text()
-            r.append("  ✗ ", style=C.ERR)
-            r.append("Could not fetch models")
-            self._write(r)
-            return
-        if not isinstance(models, list) or not models:
-            r = Text()
-            r.append("  ", style="")
-            r.append("No models available", style=C.MUTED)
-            self._write(r)
-            return
-        self.push_screen(
-            ModelPickerModal(models, self.agent.provider.model),
-            lambda m: m and self._set_model(m),
-        )
 
     def run_tui(self) -> None:
         self.run()

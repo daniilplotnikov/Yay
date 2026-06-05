@@ -1,14 +1,15 @@
 import inspect
 import importlib
+import traceback
 import pkgutil
-
+from ..events import EventBus, ErrorEvent
 from ..provider import Provider
 
 
 class ProviderManager:
-
-    def __init__(self, package):
+    def __init__(self, package, bus: EventBus):
         self.package = package
+        self.bus = bus
 
         self._providers = {}
         self._enabled = set()
@@ -27,10 +28,12 @@ class ProviderManager:
                 )
 
             except Exception as e:
-                print(
-                    f"Failed importing "
-                    f"{module_name}: {e}"
-                )
+                self.bus.emit(ErrorEvent(
+                    source='ProviderManager',
+                    message=f"Failed importing "
+                    f"{module_name}: {e}",
+                    traceback=traceback.format_exc()
+                ))
                 continue
 
             for _, cls in inspect.getmembers(

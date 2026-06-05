@@ -9,7 +9,8 @@ dependencies = [
     "requests",
     "pypdf",
     "bs4",
-    "textual"
+    "textual",
+    "websocket"
 ]
 
 [project.scripts]

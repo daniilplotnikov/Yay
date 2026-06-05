@@ -535,26 +535,31 @@ class Renderer:
 
     @staticmethod
     def tool_error(tool: str, error: str) -> list:
-        header = Text()
-        header.append(f"\n  {_icon(tool)} ", style=C.ERR)
-        header.append(f"{_label(tool)} failed", style=C.ERR)
-        detail = Text()
-        detail.append("    ")
-        detail.append(error[:300], style=C.ERR)
-        return [header, detail]
+        return Renderer.error(f"{_label(tool)} failed", error)
+    
+    @staticmethod
+    def context_compression_error(error: Any) -> list:
+        return Renderer.error("Context compression failed", error)
 
     @staticmethod
     def task_error(error: str) -> list:
+        return Renderer.error("Task failed", error)
+    
+    @staticmethod
+    def error(title: str, error: Any, prefix: str = "✗") -> list:
         header = Text()
-        header.append("\n  ✗ ", style=C.ERR)
-        header.append("Error", style=C.ERR)
-        items: list = [header]
-        for line in error.strip().splitlines():
-            t = Text()
-            t.append("    ")
-            t.append(line, style=C.ERR)
-            items.append(t)
-        return items
+        header.append(f"\n  {prefix} ", style=C.ERR)
+        header.append(title, style=C.ERR)
+
+        detail = Text()
+        detail.append("    ")
+        detail.append(str(error)[:800], style=C.ERR)
+
+        return [header, detail]
+    
+    @staticmethod
+    def generic_error(source: str, error: Any) -> list:
+        return Renderer.error(source, error)
 
     @staticmethod
     def context_compressed(before: int, after: int) -> list:
