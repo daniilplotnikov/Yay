@@ -1,6 +1,3 @@
-
----
-
 # Yay - an autonomous CLI Coding Agent 
 
 ## Installation
@@ -12,8 +9,6 @@ bash install.sh
 ```
 
 This script will automatically set up dependencies, install required packages, and configure the environment for running the agent.
-
----
 
 ## Usage
 
@@ -28,8 +23,6 @@ yay
 ```
 
 If no arguments or piped input are provided, the system automatically launches the **TUI**.
-
----
 
 ### 2. Shell Mode
 
