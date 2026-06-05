@@ -7,7 +7,6 @@ from ..provider import Provider
 from ..managers import ToolsManager
 from ..events import EventBus, ErrorEvent
 
-
 class OpenAICompatibleProvider(Provider):
 
     RETRY_COUNT = 3

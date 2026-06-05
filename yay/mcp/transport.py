@@ -10,23 +10,21 @@ from queue import Empty, Queue
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 class MCPTransport(ABC):
-    """Abstract base – every transport must implement send/receive."""
-
     @abstractmethod
     def start(self) -> None:
-        """Open connection / start process."""
+        pass
 
     @abstractmethod
     def stop(self) -> None:
-        """Close connection / kill process."""
+        pass
 
     @abstractmethod
     def send(self, message: Dict[str, Any]) -> None:
-        """Send a JSON-RPC message (fire and forget)."""
+        pass
 
     @abstractmethod
     def request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Send a request and return the response synchronously."""
+        pass
 
     def _make_id(self) -> str:
         return str(uuid.uuid4())
@@ -46,23 +44,7 @@ class MCPTransport(ABC):
             "params": params or {},
         }
 
-
-
-
-
-
 class MCPHttpSseTransport(MCPTransport):
-    """
-    MCP over HTTP with Server-Sent Events (StreamableHTTP).
-
-    POST  {base_url}/     – send requests / notifications
-    GET   {base_url}/     – open SSE stream for server→client messages
-
-    The server MAY return an SSE stream directly on the POST response
-    (StreamableHTTP mode) OR use a separate GET /sse endpoint
-    (legacy mode).  Both are handled.
-    """
-
     def __init__(
         self,
         base_url: str,
@@ -97,7 +79,6 @@ class MCPHttpSseTransport(MCPTransport):
         self._running = False
         self._session_id: Optional[str] = None  
 
-    
     def start(self) -> None:
         self._running = True
 
@@ -106,16 +87,14 @@ class MCPHttpSseTransport(MCPTransport):
         if self._sse_thread and self._sse_thread.is_alive():
             self._sse_thread.join(timeout=2)
 
-    
     def _post_url(self) -> str:
         return self.base_url + self.post_path
 
     def _sse_url(self) -> str:
         return self.base_url + self.legacy_sse_path
 
-    
     def send(self, message: Dict[str, Any]) -> None:
-        """Fire-and-forget (notifications)."""
+
         headers = {}
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
@@ -137,24 +116,21 @@ class MCPHttpSseTransport(MCPTransport):
         )
         resp.raise_for_status()
 
-        
         if "Mcp-Session-Id" in resp.headers:
             self._session_id = resp.headers["Mcp-Session-Id"]
 
         content_type = resp.headers.get("Content-Type", "")
 
-        
         if "text/event-stream" in content_type:
             return self._parse_sse_response(resp)
 
-        
         data = resp.json()
         if "error" in data:
             raise MCPError(data["error"])
         return data
 
     def _parse_sse_response(self, resp) -> Dict[str, Any]:
-        """Read SSE stream from a streaming POST response."""
+
         result = None
         for line in resp.iter_lines(decode_unicode=True):
             if not line or line.startswith(":"):
@@ -168,7 +144,7 @@ class MCPHttpSseTransport(MCPTransport):
                 if "result" in msg or "error" in msg:
                     result = msg
                     break
-                
+
                 self._dispatch_notification(msg)
 
         if result is None:
@@ -187,11 +163,8 @@ class MCPHttpSseTransport(MCPTransport):
     def on_notification(self, handler: Callable) -> None:
         self._notification_handlers.append(handler)
 
-    
-    
-    
     def start_sse_listener(self) -> None:
-        """Start background thread listening on GET /sse."""
+
         self._sse_thread = threading.Thread(
             target=self._sse_listener_loop, daemon=True
         )
@@ -233,16 +206,7 @@ class MCPHttpSseTransport(MCPTransport):
         elif "method" in msg:
             self._dispatch_notification(msg)
 
-
-
-
-
-
 class MCPStdioTransport(MCPTransport):
-    """
-    MCP over stdio – launch a subprocess and communicate via stdin/stdout.
-    Each message is a newline-delimited JSON object.
-    """
 
     def __init__(
         self,
@@ -347,17 +311,7 @@ class MCPStdioTransport(MCPTransport):
     def on_notification(self, handler: Callable) -> None:
         self._notification_handlers.append(handler)
 
-
-
-
-
-
 class MCPWebSocketTransport(MCPTransport):
-    """
-    MCP over WebSocket (ws:// or wss://).
-    Requires: pip install websocket-client
-    """
-
     def __init__(self, url: str, *, timeout: int = 30, headers: Optional[Dict[str, str]] = None):
         self.url = url
         self.timeout = timeout
@@ -446,11 +400,6 @@ class MCPWebSocketTransport(MCPTransport):
     def on_notification(self, handler: Callable) -> None:
         self._notification_handlers.append(handler)
 
-
-
-
-
-
 class MCPError(Exception):
     def __init__(self, error: Dict[str, Any]):
         self.code = error.get("code", -1)
@@ -458,22 +407,11 @@ class MCPError(Exception):
         self.data = error.get("data")
         super().__init__(f"[{self.code}] {self.message}")
 
-
-
-
-
-
 def transport_from_url(url: str, **kwargs) -> MCPTransport:
-    """
-    Create a transport from a URL scheme:
-      http:// / https://  →  MCPHttpSseTransport
-      ws:// / wss://      →  MCPWebSocketTransport
-    """
     if url.startswith("ws://") or url.startswith("wss://"):
         return MCPWebSocketTransport(url, **kwargs)
     return MCPHttpSseTransport(url, **kwargs)
 
-
 def stdio_transport(command: List[str], **kwargs) -> MCPStdioTransport:
-    """Create a stdio transport for a subprocess MCP server."""
+
     return MCPStdioTransport(command, **kwargs)

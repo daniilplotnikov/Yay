@@ -15,7 +15,6 @@ DEFAULT_CONFIG = {
     "api_key": "",
 }
 
-
 def load_config():
 
     if not CONFIG_FILE.exists():
@@ -36,7 +35,6 @@ def load_config():
 
     except Exception:
         return DEFAULT_CONFIG.copy()
-
 
 def save_config(cfg):
 

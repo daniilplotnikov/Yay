@@ -27,7 +27,7 @@ class Agent:
         tools_manager: ToolsManager,
         approve_mode: ApproveMode = "never"
     ) -> None:
-        
+
         self.bus = bus
 
         self.provider = provider

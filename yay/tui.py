@@ -14,6 +14,7 @@ from textual.widgets import (
 )
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
+from textual.events import Key
 from rich.text import Text
 from rich.table import Table
 from rich.markdown import Markdown
@@ -66,7 +67,6 @@ def _build_provider_from_providers_manager(
             kwargs[key] = val
     return cls(**kwargs)
 
-
 def _context_bar(usage: float) -> str:
     usage  = max(0.0, min(100.0, usage))
     filled = round(BAR_WIDTH * usage / 100)
@@ -89,16 +89,13 @@ def _context_bar(usage: float) -> str:
             break
     return "".join(segments) + f"[bright_black]{'░' * empty}[/]"
 
-
 def _mcp_n(mcp_manager: MCPManager | None) -> int:
     if mcp_manager is None:
         return 0
     return len(mcp_manager._configs)
 
-
 def _mcp_keys(mcp_manager: MCPManager) -> list[str]:
     return list(mcp_manager._configs.keys())
-
 
 def _mcp_key_by_index(mcp_manager: MCPManager, idx: int) -> str | None:
     keys = _mcp_keys(mcp_manager)
@@ -113,7 +110,7 @@ class CommandSuggester(Suggester):
         "/context", "/history", "/reset", "/clear", "/quit",
         "/approve", "/approve never", "/approve safe", "/approve always",
         "/baseurl", "/set_context_length", "/compress_context",
-        "/pause", "/resume",
+        "/pause", "/resume", "/interrupt",
         "/steer", "/steer clear",
         "/queue",
         "/mcp", "/mcp add", "/mcp remove", "/mcp enable", "/mcp disable",
@@ -324,7 +321,6 @@ class MCPModal(ModalScreen):
             tbl.add_row(*cells)
 
     def _refresh_buttons(self) -> None:
-        """Toggle Enable/Disable button depending on selected server state."""
         btn = self.query_one("#btn-mcp-toggle", Button)
 
         key = self._selected_key()
@@ -809,8 +805,11 @@ class ModelPickerModal(ModalScreen):
 class StreamView(Static):
     DEFAULT_CSS = """
     StreamView {
-        height: auto; max-height: 60%;
-        padding: 0 2; background: $background; overflow-y: auto;
+        height: auto;
+        max-height: 60%;
+        padding: 0 2;
+        background: $background;
+        overflow-y: auto;
     }
     """
 
@@ -820,26 +819,41 @@ class StreamView(Static):
         self._partial:  str       = ""
         self._lock      = threading.Lock()
         self._streaming = False
+        self._pending_update = False
 
     def push_chunk(self, text: str) -> None:
+
         with self._lock:
             self._partial += text
             while "\n" in self._partial:
                 line, self._partial = self._partial.split("\n", 1)
                 self._lines.append(line)
             self._streaming = True
-        self.app.call_from_thread(self._update_display)
+            schedule = not self._pending_update
+            if schedule:
+                self._pending_update = True
+
+        if schedule:
+            self.app.call_from_thread(self._update_display)
 
     def _update_display(self) -> None:
+
         with self._lock:
             content = "\n".join(self._lines)
             if self._partial:
                 content = (content + "\n" if content else "") + self._partial
             streaming = self._streaming
-        self.styles.border = ("solid", "blue") if streaming else None
-        super().update(Markdown(content, code_theme="monokai"))
+            self._pending_update = False
+
+        if streaming:
+            self.styles.border = ("solid", "blue")
+        else:
+            self.styles.border = None
+
+        super().update(Markdown(content, code_theme="monokai") if content.strip() else "")
 
     def commit(self) -> str:
+
         with self._lock:
             if self._partial:
                 self._lines.append(self._partial)
@@ -847,45 +861,82 @@ class StreamView(Static):
             full = "\n".join(self._lines)
             self._lines     = []
             self._streaming = False
-        self.app.call_from_thread(self._update_display)
+            self._pending_update = False
+
+        try:
+            self.app.call_from_thread(self._clear_display)
+        except Exception:
+            self._clear_display()
+
         return full
 
     def cancel(self) -> str:
+
         return self.commit()
+
+    def _clear_display(self) -> None:
+        self.styles.border = None
+        super().update("")
 
 class AgentTUI(App):
     CSS = """
     Screen { layers: base; }
+
     #log {
-        height: 1fr; border: none; padding: 0 2; scrollbar-gutter: stable;
+        height: 1fr;
+        border: none;
+        padding: 0 2;
+        scrollbar-gutter: stable;
     }
+
     StreamView {
-        height: auto; max-height: 60%; padding: 0 2; background: $background;
+        height: auto;
+        max-height: 60%;
+        padding: 0 2;
+        background: $background;
     }
+
     #input-bar {
-        height: 3; border-top: solid $accent; background: $surface;
-        padding: 0 1; layout: horizontal; align: left middle;
+        height: 3;
+        border-top: solid $accent;
+        background: $surface;
+        padding: 0 1;
+        layout: horizontal;
+        align: left middle;
     }
+
     #prompt-label {
-        width: auto; color: $accent; padding: 0 1 0 0; content-align: left middle;
+        width: auto;
+        color: $accent;
+        padding: 0 1 0 0;
+        content-align: left middle;
     }
+
     #prompt-label.question-mode   { color: yellow; }
     #prompt-label.approval-mode   { color: orange; }
     #prompt-label.interrupted     { color: red; }
+
     #cmd-input {
-        height: 1; width: 1fr; border: none; background: transparent;
+        height: 1;
+        width: 1fr;
+        border: none;
+        background: transparent;
     }
+
     #cmd-input:focus { border: none; }
+
     Footer { height: 1; }
     """
 
     BINDINGS = [
-        Binding("ctrl+p", "toggle_pause",        "Pause/Resume"),
-        Binding("ctrl+c", "do_interrupt",         "Interrupt"),
-        Binding("ctrl+s", "open_settings",        "Settings"),
-        Binding("ctrl+m", "open_model_picker",    "Models"),
-        Binding("ctrl+r", "open_provider_picker", "Provider"),
-        Binding("ctrl+e", "open_mcp",             "MCP"),
+        Binding("ctrl+p",     "toggle_pause",        "Pause/Resume"),
+        Binding("ctrl+c",     "do_interrupt",         "Interrupt",   show=True),
+        Binding("ctrl+s",     "open_settings",        "Settings"),
+        Binding("ctrl+m",     "open_model_picker",    "Models"),
+        Binding("ctrl+r",     "open_provider_picker", "Provider"),
+        Binding("ctrl+e",     "open_mcp",             "MCP"),
+
+        Binding("tab",        "accept_suggestion",    "Complete",    show=False),
     ]
 
     def __init__(
@@ -904,8 +955,8 @@ class AgentTUI(App):
         self._R                = Renderer()
         self.bus               = bus
 
-        self._approval_pending  = threading.Event() 
-        self._approval_done     = threading.Event() 
+        self._approval_pending  = threading.Event()
+        self._approval_done     = threading.Event()
         self._approval_tool     = ""
         self._approval_result: bool | None = None
 
@@ -917,6 +968,10 @@ class AgentTUI(App):
         self._streaming      = False
         self._interrupt_flag = threading.Event()
         self._interrupted    = False
+
+        self._history:     list[str] = []
+        self._history_idx: int       = -1
+        self._history_draft: str     = ""
 
     def compose(self) -> ComposeResult:
         yield StatusBar(id="statusbar")
@@ -936,6 +991,51 @@ class AgentTUI(App):
         self._register_event_handlers()
         self.call_after_refresh(self._tick_status)
         self.set_interval(2, self._tick_status)
+
+    def on_key(self, event: Key) -> None:
+        inp = self.query_one("#cmd-input", Input)
+        if not inp.has_focus:
+            return
+
+        if event.key == "up":
+            self._history_up()
+            event.stop()
+            event.prevent_default()
+        elif event.key == "down":
+            self._history_down()
+            event.stop()
+            event.prevent_default()
+
+    def action_accept_suggestion(self) -> None:
+
+        inp = self.query_one("#cmd-input", Input)
+        if inp.has_focus and inp._suggestion:        
+            inp.value    = inp._suggestion              
+            inp.cursor_position = len(inp.value)
+
+    def _history_up(self) -> None:
+        if not self._history:
+            return
+        inp = self.query_one("#cmd-input", Input)
+        if self._history_idx == -1:
+            self._history_draft = inp.value
+            self._history_idx   = len(self._history) - 1
+        elif self._history_idx > 0:
+            self._history_idx -= 1
+        inp.value           = self._history[self._history_idx]
+        inp.cursor_position = len(inp.value)
+
+    def _history_down(self) -> None:
+        if self._history_idx == -1:
+            return
+        inp = self.query_one("#cmd-input", Input)
+        if self._history_idx < len(self._history) - 1:
+            self._history_idx += 1
+            inp.value = self._history[self._history_idx]
+        else:
+            self._history_idx = -1
+            inp.value         = self._history_draft
+        inp.cursor_position = len(inp.value)
 
     def _tick_status(self) -> None:
         try:
@@ -966,10 +1066,13 @@ class AgentTUI(App):
 
     def _write(self, renderable: Any) -> None:
         def _do():
-            self.query_one("#log", RichLog).write(renderable)
+            try:
+                self.query_one("#log", RichLog).write(renderable)
+            except Exception:
+                pass
         try:
             self.call_from_thread(_do)
-        except Exception:
+        except RuntimeError:
             _do()
 
     def _write_many(self, items: list) -> None:
@@ -980,43 +1083,51 @@ class AgentTUI(App):
         return self.query_one("#stream-view", StreamView)
 
     def _stream_chunk(self, text: str) -> None:
-        if not self._streaming:
-            self._streaming = True
+
+        self._streaming = True
         self._sv().push_chunk(text)
 
     def _stream_close(self) -> None:
+
         if not self._streaming:
             return
         self._streaming = False
         sv        = self._sv()
-        full_text = sv.commit()
+        full_text = sv.commit()  # clears StreamView
+
         if full_text.strip():
             def _commit():
-                log = self.query_one("#log", RichLog)
-                log.write(Text(""))
-                log.write(Markdown(full_text, code_theme="monokai"))
-                log.write(Text(""))
+                try:
+                    log = self.query_one("#log", RichLog)
+                    log.write(Text(""))
+                    log.write(Markdown(full_text, code_theme="monokai"))
+                    log.write(Text(""))
+                except Exception:
+                    pass
             try:
                 self.call_from_thread(_commit)
-            except Exception:
+            except RuntimeError:
                 _commit()
 
     def _stream_cancel(self) -> None:
-        """Cancel the current stream visually; sets interrupt flag for the agent."""
+
         if self._streaming:
             self._streaming = False
             partial = self._sv().cancel()
             if partial.strip():
                 def _commit():
-                    log = self.query_one("#log", RichLog)
-                    log.write(Text(""))
-                    log.write(Markdown(partial, code_theme="monokai"))
-                    t = Text()
-                    t.append("  … interrupted", style=C.WARN)
-                    log.write(t)
+                    try:
+                        log = self.query_one("#log", RichLog)
+                        log.write(Text(""))
+                        log.write(Markdown(partial, code_theme="monokai"))
+                        t = Text()
+                        t.append("  … interrupted", style=C.WARN)
+                        log.write(t)
+                    except Exception:
+                        pass
                 try:
                     self.call_from_thread(_commit)
-                except Exception:
+                except RuntimeError:
                     _commit()
 
         self._interrupt_flag.set()
@@ -1034,8 +1145,8 @@ class AgentTUI(App):
 
         try:
             self.call_from_thread(self._tick_status)
-        except Exception:
-            pass
+        except RuntimeError:
+            self._tick_status()
 
     def _clear_interrupt(self) -> None:
         self._interrupt_flag.clear()
@@ -1189,7 +1300,7 @@ class AgentTUI(App):
 
         @self.bus.subscribe(ErrorEvent)
         def _(e: ErrorEvent):
-            self._write_many(self._R.generic_error(e.source, e.message))
+            self._write_many(self._R.generic_error(e.source, e.message, e.traceback))
 
         @self.bus.subscribe(ContextCompressedEvent)
         def _(e: ContextCompressedEvent):
@@ -1220,8 +1331,17 @@ class AgentTUI(App):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         event.input.value = ""
+
+        self._history_idx   = -1
+        self._history_draft = ""
         if not text:
             return
+
+        if not self._history or self._history[-1] != text:
+            self._history.append(text)
+
+            if len(self._history) > 500:
+                self._history = self._history[-500:]
 
         if self._approval_pending.is_set():
             self._approval_pending.clear()
@@ -1251,7 +1371,7 @@ class AgentTUI(App):
 
         self._dispatch(text)
 
-    def _dispatch(self, text: str) -> None:
+    def _dispatch(self, text: str) -> None:  
         t = text.strip()
 
         def info(msg: str) -> None:
@@ -1319,7 +1439,9 @@ class AgentTUI(App):
                 ("/set_context_length <n>",        "Max tokens"),
                 ("/compress_context",              "Compress now"),
                 ("/pause  /resume  Ctrl+P",        "Pause / resume agent"),
-                ("Ctrl+C",                         "Interrupt current task"),
+                ("/interrupt  Ctrl+C",             "Interrupt current task"),
+                ("Tab",                            "Accept autocomplete suggestion"),
+                ("↑ / ↓",                          "Navigate input history"),
                 ("/steer [text|clear]",            "Steering instructions"),
                 ("/queue",                         "Task queue"),
                 ("/clear",                         "Clear log"),
@@ -1612,6 +1734,9 @@ class AgentTUI(App):
             else:
                 info("Not paused")
 
+        elif t == "/interrupt":
+            self._do_interrupt_command()
+
         elif t == "/steer":
             instrs = getattr(self.agent.steering, "instructions", [])
             if not instrs:
@@ -1656,6 +1781,21 @@ class AgentTUI(App):
             self._clear_interrupt()
             self.agent.enqueue(prompt=t, task_id=str(time.time()))
 
+    def _do_interrupt_command(self) -> None:
+        if self.agent.current_task is None and not self._streaming:
+            r = Text()
+            r.append("  ", style="")
+            r.append("No task running", style=C.MUTED)
+            self._write(r)
+            return
+        r = Text()
+        r.append("  ✗ ", style=C.ERR)
+        r.append("Interrupted by user", style=C.WARN)
+        self._write(r)
+        self._stream_cancel()
+        self.agent.stop_queue()
+        self.agent.start_queue()
+
     def action_toggle_pause(self) -> None:
         if self.agent.is_paused:
             self.agent.resume()
@@ -1670,17 +1810,11 @@ class AgentTUI(App):
         self._tick_status()
 
     def action_do_interrupt(self) -> None:
-        """Ctrl+C – interrupt the currently running agent task."""
+
         if self.agent.current_task is None and not self._streaming:
             self.exit()
             return
-        r = Text()
-        r.append("  ✗ ", style=C.ERR)
-        r.append("Interrupted by user", style=C.WARN)
-        self._write(r)
-        self._stream_cancel()
-        self.agent.stop_queue()
-        self.agent.start_queue()
+        self._do_interrupt_command()
 
     def action_open_settings(self) -> None:
         def _cb(result):

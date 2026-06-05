@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict
 
-
 class Tool(ABC):
     def __init__(self):
         self.name: str = self.__class__.__name__

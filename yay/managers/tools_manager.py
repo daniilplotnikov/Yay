@@ -98,7 +98,6 @@ class ToolsManager:
             if name in self._enabled
         }
 
-
     def get_all_tools(self):
         return list(
             self._tools.values()

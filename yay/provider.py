@@ -49,7 +49,7 @@ class Provider(ABC):
 
     def supports_summarization(self) -> bool:
         return True
-    
+
 class NonSelectedProvider(Provider):
 
     def __init__(self):

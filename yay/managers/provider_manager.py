@@ -5,7 +5,6 @@ import pkgutil
 from ..events import EventBus, ErrorEvent
 from ..provider import Provider
 
-
 class ProviderManager:
     def __init__(self, package, bus: EventBus):
         self.package = package

@@ -11,7 +11,6 @@ from .events import ErrorEvent
 
 WORKSPACE_FILE = ".yay_workspace.json"
 
-
 def workspace_path() -> Path:
     return Path.cwd() / WORKSPACE_FILE
 
@@ -135,7 +134,6 @@ def clear_workspace() -> None:
     path = workspace_path()
     if path.exists():
         path.unlink()
-
 
 def workspace_exists() -> bool:
     return workspace_path().exists()

@@ -29,7 +29,6 @@ def run_tui():
 
     tui.run()
 
-
 def main():
     has_args = len(sys.argv) > 1
     has_pipe = not sys.stdin.isatty()

@@ -16,7 +16,7 @@ class MCPTool:
     @property
     def arguments(self) -> Dict:
         return self.input_schema
-    
+
     def __call__(self, args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any:
         if args is not None:
             return self._client.call_tool(self.name, args)
@@ -24,7 +24,6 @@ class MCPTool:
 
     def execute(self, args: Dict[str, Any]) -> Any:
         return self._client.call_tool(self.name, args)
-
 
 @dataclass
 class MCPResource:
@@ -36,7 +35,6 @@ class MCPResource:
 
     def read(self) -> Any:
         return self._client.read_resource(self.uri)
-
 
 @dataclass
 class MCPPrompt:
@@ -56,7 +54,6 @@ CAPABILITIES = {
     "roots": {"listChanged": True},
     "sampling": {},
 }
-
 
 class MCPClient:
     """
@@ -88,12 +85,10 @@ class MCPClient:
         self.client_info = client_info or CLIENT_INFO
         self.roots = roots or []
 
-        
         self.server_info: Dict[str, Any] = {}
         self.server_capabilities: Dict[str, Any] = {}
         self.protocol_version: str = PROTOCOL_VERSION
 
-        
         self._progress_handlers: List[Callable] = []
         self._resource_update_handlers: List[Callable] = []
         self._prompt_list_handlers: List[Callable] = []
@@ -111,13 +106,13 @@ class MCPClient:
             transport.on_notification(self._handle_notification)
 
     def start(self) -> "MCPClient":
-        """Start transport and run the MCP handshake."""
+
         self.transport.start()
         self.initialize()
         return self
 
     def stop(self) -> None:
-        """Send shutdown notification and stop transport."""
+
         if self._initialized:
             try:
                 self._notify("notifications/cancelled", {})
@@ -131,10 +126,6 @@ class MCPClient:
 
     def __exit__(self, *_: Any) -> None:
         self.stop()
-
-    
-    
-    
 
     def initialize(self) -> Dict[str, Any]:
         """
@@ -151,17 +142,12 @@ class MCPClient:
         self.server_capabilities = result.get("capabilities", {})
         self.protocol_version = result.get("protocolVersion", PROTOCOL_VERSION)
 
-        
         self._notify("notifications/initialized", {})
         self._initialized = True
         return result
 
-    
-    
-    
-
     def list_tools(self, cursor: Optional[str] = None) -> List[MCPTool]:
-        """List all tools exposed by the server (handles pagination)."""
+
         self._assert_capability("tools")
         tools: List[MCPTool] = []
         params: Dict[str, Any] = {}
@@ -213,12 +199,8 @@ class MCPClient:
 
         return result.get("content", result)
 
-    
-    
-    
-
     def list_resources(self, cursor: Optional[str] = None) -> List[MCPResource]:
-        """List all resources (paginated)."""
+
         self._assert_capability("resources")
         resources: List[MCPResource] = []
         params: Dict[str, Any] = {}
@@ -249,13 +231,13 @@ class MCPClient:
         return resp.get("result", {}).get("resourceTemplates", [])
 
     def read_resource(self, uri: str) -> Dict[str, Any]:
-        """Read a resource by URI. Returns the result dict with contents."""
+
         self._assert_capability("resources")
         resp = self._request("resources/read", {"uri": uri})
         return resp.get("result", {})
 
     def subscribe_resource(self, uri: str) -> None:
-        """Subscribe to resource change notifications."""
+
         cap = self.server_capabilities.get("resources", {})
         if not cap.get("subscribe"):
             raise RuntimeError("Server does not support resource subscriptions")
@@ -265,12 +247,8 @@ class MCPClient:
         self._assert_capability("resources")
         self._request("resources/unsubscribe", {"uri": uri})
 
-    
-    
-    
-
     def list_prompts(self, cursor: Optional[str] = None) -> List[MCPPrompt]:
-        """List all prompts (paginated)."""
+
         self._assert_capability("prompts")
         prompts: List[MCPPrompt] = []
         params: Dict[str, Any] = {}
@@ -295,17 +273,13 @@ class MCPClient:
         return prompts
 
     def get_prompt(self, name: str, arguments: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        """Get a prompt with optional argument substitution."""
+
         self._assert_capability("prompts")
         params: Dict[str, Any] = {"name": name}
         if arguments:
             params["arguments"] = arguments
         resp = self._request("prompts/get", params)
         return resp.get("result", {})
-
-    
-    
-    
 
     def set_log_level(self, level: str) -> None:
         """
@@ -317,32 +291,20 @@ class MCPClient:
             return  
         self._request("logging/setLevel", {"level": level})
 
-    
-    
-    
-
     def ping(self) -> bool:
-        """Send a ping. Returns True if server responds."""
+
         try:
             self._request("ping", {})
             return True
         except Exception:
             return False
 
-    
-    
-    
-
     def cancel(self, request_id: str, reason: Optional[str] = None) -> None:
-        """Send a cancellation notification for an in-flight request."""
+
         params: Dict[str, Any] = {"requestId": request_id}
         if reason:
             params["reason"] = reason
         self._notify("notifications/cancelled", params)
-
-    
-    
-    
 
     def set_sampling_handler(self, handler: Callable[[Dict[str, Any]], Dict[str, Any]]) -> None:
         """
@@ -351,7 +313,7 @@ class MCPClient:
         The handler receives the full params dict and must return a result dict::
 
             def my_handler(params):
-                
+
                 return {
                     "role": "assistant",
                     "content": {"type": "text", "text": "..."},
@@ -360,10 +322,6 @@ class MCPClient:
                 }
         """
         self._sampling_handler = handler
-
-    
-    
-    
 
     def set_roots_handler(self, handler: Callable[[], List[Dict[str, Any]]]) -> None:
         """
@@ -377,14 +335,10 @@ class MCPClient:
         self._roots_list_handler = handler
 
     def set_roots(self, roots: List[Dict[str, Any]]) -> None:
-        """Set static roots and notify the server of the change."""
+
         self.roots = roots
         if self._initialized:
             self._notify("notifications/roots/listChanged", {})
-
-    
-    
-    
 
     def on_progress(self, handler: Callable) -> None:
         self._progress_handlers.append(handler)
@@ -400,10 +354,6 @@ class MCPClient:
 
     def on_log(self, handler: Callable) -> None:
         self._log_handlers.append(handler)
-
-    
-    
-    
 
     def _handle_notification(self, msg: Dict[str, Any]) -> None:
         method = msg.get("method", "")
@@ -496,7 +446,6 @@ class MCPClient:
                 f"Server does not advertise '{cap}' capability. "
                 f"Available: {list(self.server_capabilities.keys())}"
             )
-
 
 def _safe(fn: Callable, *args: Any) -> None:
     try:

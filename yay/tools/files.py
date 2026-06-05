@@ -93,7 +93,7 @@ class CreateDirectoryTool(Tool):
             "action": "created_directory",
             "path": path,
         }
-    
+
 class RemoveFileTool(Tool):
     def __init__(self):
         super().__init__()
@@ -323,11 +323,11 @@ class SearchTool(Tool):
                     continue
 
         return results
-    
+
 class PatchFileTool(Tool):
     def __init__(self):
         super().__init__()
- 
+
         self.name = "PatchFile"
         self.description = "Apply search/replace patches to file"
 
@@ -545,7 +545,7 @@ class ReadFilesTool(Tool):
             "count": len(results),
             "files": results
         }
-    
+
 class GetFileInfoTool(Tool):
     def __init__(self):
         super().__init__()
@@ -587,7 +587,7 @@ class GetFileInfoTool(Tool):
                 "error": str(e),
                 "path": path
             }
-        
+
 class GrepTool(Tool):
     def __init__(self):
         super().__init__()
@@ -651,7 +651,7 @@ class GrepTool(Tool):
             "matches": len(results),
             "results": results[:500],
         }
-    
+
 class GlobTool(Tool):
     def __init__(self):
         super().__init__()

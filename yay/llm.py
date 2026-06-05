@@ -5,7 +5,6 @@ from typing import Any, Callable, Dict, List, Optional
 from .events import EventBus, ContextCompressionNeededEvent
 SYSTEM_SUMMARY_MARKER = "[COMPRESSED_CONTEXT]"
 
-
 class Content:
     def __init__(self, text: str = "") -> None:
         self.text = text
@@ -13,7 +12,6 @@ class Content:
     def __repr__(self) -> str:
         preview = self.text[:60].replace("\n", "\\n")
         return f"Content({preview!r}{'…' if len(self.text) > 60 else ''})"
-
 
 class Message:
     def __init__(
@@ -34,7 +32,6 @@ class Message:
 
     def __repr__(self) -> str:
         return f"Message(role={self.role!r}, tool={bool(self.tool)})"
-
 
 class Context:
     def __init__(

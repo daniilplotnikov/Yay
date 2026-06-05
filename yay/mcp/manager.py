@@ -4,16 +4,12 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from .client import MCPClient, MCPTool, MCPResource, MCPPrompt
 from .transport import (
-    MCPHttpSseTransport,
     MCPStdioTransport,
-    MCPWebSocketTransport,
     transport_from_url,
     stdio_transport,
 )
 
 class _ServerConfig:
-    """Internal representation of a registered MCP server."""
-
     def __init__(
         self,
         key: str,
@@ -41,23 +37,7 @@ class _ServerConfig:
             return transport_from_url(self.url, headers=self.headers, timeout=self.timeout)
         raise ValueError("Server config has neither url nor command")
 
-
-
-
-
-
 class MCPManager:
-    """
-    Manages a pool of MCP server connections.
-
-    Parameters
-    ----------
-    tools_manager : optional
-        Object with ``register_many(tools)`` and ``unregister(name)`` methods.
-    bus : optional
-        Event bus with ``emit(event)`` method for error broadcasting.
-    """
-
     def __init__(self, tools_manager=None, bus=None):
         self.tools_manager = tools_manager
         self.bus = bus
@@ -65,17 +45,11 @@ class MCPManager:
         self._configs: Dict[str, _ServerConfig] = {}    
         self._clients: Dict[str, MCPClient] = {}         
 
-        
         self._tools:     Dict[str, List[str]] = {}
         self._resources: Dict[str, List[str]] = {}
         self._prompts:   Dict[str, List[str]] = {}
 
-        
         self._notification_handlers: List[Callable] = []
-
-    
-    
-    
 
     def add(
         self,
@@ -85,7 +59,7 @@ class MCPManager:
         headers: Optional[Dict[str, str]] = None,
         timeout: int = 30,
     ) -> None:
-        """Register an HTTP/WS MCP server by URL."""
+
         key = url.rstrip("/")
         if key in self._configs:
             return
@@ -102,11 +76,6 @@ class MCPManager:
         env: Optional[Dict[str, str]] = None,
         timeout: int = 30,
     ) -> str:
-        """
-        Register a stdio MCP server by command.
-
-        Returns the key used for this server.
-        """
         derived_key = key or f"stdio://{' '.join(command)}"
         if derived_key in self._configs:
             return derived_key
@@ -116,7 +85,6 @@ class MCPManager:
         return derived_key
 
     def remove(self, ref: Union[int, str]) -> None:
-        """Remove a server by key or index."""
         key = self._resolve_key(ref)
         self._disconnect(key)
         del self._configs[key]
@@ -130,12 +98,7 @@ class MCPManager:
         self._configs[key].enabled = False
         self._disconnect(key)
 
-    
-    
-    
-
     def connect(self, ref: Union[int, str]) -> MCPClient:
-        """Connect to a single server and return its client."""
         key = self._resolve_key(ref)
         cfg = self._configs[key]
 
@@ -144,7 +107,6 @@ class MCPManager:
         transport = cfg.build_transport()
         client = MCPClient(transport)
 
-        
         if hasattr(transport, "on_notification"):
             transport.on_notification(
                 lambda msg, _key=key: self._on_server_notification(_key, msg)
@@ -156,7 +118,6 @@ class MCPManager:
         return client
 
     def connect_all(self) -> Dict[str, Any]:
-        """Connect to all enabled servers. Returns a status report."""
         results: Dict[str, Any] = {}
         for key, cfg in self._configs.items():
             if not cfg.enabled:
@@ -180,9 +141,7 @@ class MCPManager:
                 self._emit_error(key, exc)
         return results
 
-    
     def fetch_server(self, url: str) -> List[MCPTool]:
-        """Connect to url (adding it if needed) and return its tools."""
         if url.rstrip("/") not in self._configs:
             self.add(url)
         self.connect(url)
@@ -198,10 +157,6 @@ class MCPManager:
         for key in list(self._clients.keys()):
             self._disconnect(key)
         return self.connect_all()
-
-    
-    
-    
 
     def list_tools(self, ref: Union[int, str]) -> List[MCPTool]:
         client = self._get_client(ref)
@@ -237,18 +192,13 @@ class MCPManager:
         client = self._get_client(ref)
         return client.get_prompt(name, arguments)
 
-    
-    
-    
-
     def ping_all(self) -> Dict[str, bool]:
-        """Ping all known servers. Reconnects if needed."""
         out: Dict[str, bool] = {}
         for key, cfg in self._configs.items():
             if key in self._clients:
                 out[key] = self._clients[key].ping()
             else:
-                
+
                 try:
                     transport = cfg.build_transport()
                     transport.start()
@@ -259,19 +209,10 @@ class MCPManager:
                     out[key] = False
         return out
 
-    
-    
-    
-
     def on_notification(self, handler: Callable) -> None:
-        """
-        Register a handler for all server notifications.
-        Called as ``handler(server_key: str, message: dict)``.
-        """
         self._notification_handlers.append(handler)
 
     def _on_server_notification(self, key: str, msg: Dict[str, Any]) -> None:
-        
         method = msg.get("method", "")
         if method == "notifications/tools/list_changed" and key in self._clients:
             try:
@@ -295,10 +236,6 @@ class MCPManager:
             except Exception:
                 pass
 
-    
-    
-    
-
     def status_rows(self) -> List[Dict[str, Any]]:
         rows = []
         for i, (key, cfg) in enumerate(self._configs.items()):
@@ -317,15 +254,10 @@ class MCPManager:
         return rows
 
     def get_client(self, ref: Union[int, str]) -> Optional[MCPClient]:
-        """Return the live MCPClient for a server, or None."""
         try:
             return self._get_client(ref)
         except Exception:
             return None
-
-    
-    
-    
 
     def _resolve_key(self, ref: Union[int, str]) -> str:
         if isinstance(ref, int):
@@ -349,7 +281,6 @@ class MCPManager:
             except Exception:
                 pass
 
-        
         if self.tools_manager:
             for name in self._tools.get(key, []):
                 try:
@@ -374,7 +305,6 @@ class MCPManager:
             self._refresh_prompts(key, client)
 
     def _refresh_tools(self, key: str, client: MCPClient) -> None:
-        
         if self.tools_manager:
             for name in self._tools.get(key, []):
                 try:

@@ -50,7 +50,7 @@ class ShellUI:
         self._register_handlers()
 
     def _start_stream(self) -> None:
-        """Must be called with self._stream_lock held."""
+
         if self._streaming:
             return
         self._stream_buf = ""
@@ -68,7 +68,7 @@ class ShellUI:
             self._end_stream_locked()
 
     def _end_stream_locked(self) -> None:
-        """Must be called with self._stream_lock held."""
+
         if not self._streaming:
             return
         if self._live:
@@ -233,7 +233,6 @@ class _McpAction(argparse.Action):
         servers.append({"type": kind, "target": target, "label": None, "env": {}})
         namespace.mcp_servers = servers
 
-
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="yay",
@@ -313,7 +312,6 @@ Examples:
 
     return p
 
-
 def _parse_mcp_env(raw: list[str]) -> dict[str, str]:
     env: dict[str, str] = {}
     for item in raw:
@@ -330,7 +328,7 @@ def _wire_mcp(
     extra_env: dict[str, str],
     console: Console,
 ) -> None:
-    """Register and connect all requested MCP servers."""
+
     if mcp_manager is None:
         _warn(console, "MCPManager not available – MCP servers will be skipped.")
         return
@@ -382,7 +380,6 @@ def _wire_mcp(
                 t.append(f"  {info['error']}", style="grey50")
                 console.print(t)
         console.print()
-
 
 def _warn(console: Console, msg: str) -> None:
     console.print(f"  [bold yellow]⚠[/]  [yellow]{msg}[/]")

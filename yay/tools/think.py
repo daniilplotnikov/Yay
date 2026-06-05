@@ -24,7 +24,7 @@ class ThinkTool(Tool):
 
     def execute(self, args):
         return args["thought"]
-    
+
 class PlanTool(Tool):
     def __init__(self):
         super().__init__()
@@ -102,7 +102,7 @@ class PlanTool(Tool):
         return {
             "error": f"Unknown action: {action}"
         }
-    
+
 class QuestionTool(Tool):
     def __init__(self):
         super().__init__()

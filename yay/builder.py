@@ -20,7 +20,6 @@ def _get_api_key(cfg: dict, provider_name: str) -> str:
         return cfg.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY", "") or cfg.get("api_key", "")
     return cfg.get("api_key") or os.getenv("API_KEY", "") or "dummy"
 
-
 def _name_matches(cls, provider_name: str) -> bool:
     target = provider_name.strip().lower()
     if not target:
@@ -31,7 +30,6 @@ def _name_matches(cls, provider_name: str) -> bool:
         cls.__name__,
     ]
     return any(c.strip().lower() == target for c in candidates if c)
-
 
 def _instantiate_provider(cls, cfg: dict, provider_name: str,
                            tools_manager: ToolsManager, bus: EventBus):
