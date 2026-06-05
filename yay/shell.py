@@ -1,17 +1,3 @@
-"""
-shell.py – CLI entry point with full MCP support.
-
-Supports:
-  --mcp-http  <url>            HTTP+SSE MCP server
-  --mcp-ws    <url>            WebSocket MCP server
-  --mcp-stdio <cmd> [args...]  stdio MCP server (subprocess)
-  --mcp-env   KEY=VAL ...      extra env vars passed to all stdio servers
-  --mcp-label <label>          label for the LAST added server
-  --no-mcp                     skip all MCP servers
-  --approve                    auto-approve all tool calls
-  --list-tools                 list all available tools and exit
-"""
-
 from __future__ import annotations
 
 import argparse

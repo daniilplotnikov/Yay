@@ -9,11 +9,6 @@ from abc import ABC, abstractmethod
 from queue import Empty, Queue
 from typing import Any, Callable, Dict, Generator, List, Optional
 
-
-
-
-
-
 class MCPTransport(ABC):
     """Abstract base – every transport must implement send/receive."""
 
