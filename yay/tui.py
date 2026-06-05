@@ -1,23 +1,3 @@
-"""
-tui.py – Textual TUI for the agent.
-
-Fixes vs original:
-  • register_event_handlers() now called from on_mount (was never called)
-  • Deadlock fix: ApprovalRequestedEvent and QuestionRequestedEvent handlers
-    must NOT block the Textual event loop – blocking .wait() moved out of
-    the bus handler into the input path, using call_from_thread for UI updates
-  • Real interrupt (Ctrl+C): sets _interrupt_flag on the agent thread so
-    provider.process_stream is cancelled via a threading.Event; agent loop
-    checks the flag after each iteration
-  • Real pause: pausing before a streaming call is supported; if pause
-    happens mid-stream we wait at the next loop iteration checkpoint
-  • Added missing imports: AgentPausedEvent, AgentResumedEvent, ToolStartedEvent
-  • MCPModal: shows error feedback inside the modal on connect failure
-  • /mcp add supports stdio via "stdio://" prefix:
-      /mcp add stdio://npx -y @modelcontextprotocol/server-filesystem /tmp
-  • status_rows() n_tools key used correctly everywhere
-  • SettingsModal MCP tab shows connected/disconnected state correctly
-"""
 from __future__ import annotations
 
 import os
