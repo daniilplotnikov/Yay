@@ -3,8 +3,8 @@ import yay.tools as tools_pkg
 import yay.providers as providers_pkg
 
 from .builder import build_agent
-from .tui import AgentTUI
-from .shell import run_shell
+from .ui.tui import AgentTUI
+from .ui.shell import run_shell
 from .managers import (
     ProviderManager,
     ToolsManager,

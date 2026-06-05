@@ -15,7 +15,7 @@ from rich.text import Text
 from rich.table import Table
 from rich import box
 
-from .events import (
+from ..events import (
     EventBus,
     ModelProcessingEvent,
     StreamChunkEvent,
@@ -213,10 +213,6 @@ class ShellUI:
                 self.console.print(item)
 
 class _McpAction(argparse.Action):
-    """
-    Collects MCP server specs into namespace.mcp_servers as a list of dicts:
-        {"type": "http"|"ws"|"stdio", "target": str|list, "label": str|None, "env": dict}
-    """
     def __call__(self, parser, namespace, values, option_string=None):
         servers: list = getattr(namespace, "mcp_servers", None) or []
         kind = {
@@ -483,7 +479,7 @@ def run_shell(
     providers_manager,
     mcp_manager=None,
 ) -> int:
-    from .builder import build_agent
+    from ..builder import build_agent
 
     parser  = _build_arg_parser()
     args    = parser.parse_args()

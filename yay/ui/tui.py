@@ -20,14 +20,14 @@ from rich.table import Table
 from rich.markdown import Markdown
 from pathlib import Path
 
-from .agent import Agent
-from .llm import Context
+from ..agent import Agent
+from ..llm import Context
 from .renderer import Renderer, C, _icon, _token_color
-from .config import load_config, save_config
-from .workspace import save_workspace
-from .managers import ProviderManager, ToolsManager
-from .mcp import MCPManager
-from .events import (
+from ..config import load_config, save_config
+from ..workspace import save_workspace
+from ..managers import ProviderManager, ToolsManager
+from ..mcp import MCPManager
+from ..events import (
     EventBus,
     TaskStartedEvent, ModelProcessingEvent, ApprovalRequestedEvent,
     StreamChunkEvent, ProviderResponseEvent, TaskFinishedEvent, TaskErrorEvent,

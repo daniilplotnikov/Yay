@@ -56,24 +56,6 @@ CAPABILITIES = {
 }
 
 class MCPClient:
-    """
-    Full MCP client.
-
-    Usage::
-
-        transport = MCPHttpSseTransport("http://localhost:3000")
-        client = MCPClient(transport)
-        client.start()                  
-        tools = client.list_tools()
-        result = client.call_tool("myTool", {"arg": "value"})
-        client.stop()
-
-    Or as a context manager::
-
-        with MCPClient(transport) as client:
-            tools = client.list_tools()
-    """
-
     def __init__(
         self,
         transport: MCPTransport,
@@ -128,10 +110,6 @@ class MCPClient:
         self.stop()
 
     def initialize(self) -> Dict[str, Any]:
-        """
-        Perform the MCP initialize handshake.
-        Must be called before any other method.
-        """
         resp = self._request("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "clientInfo": self.client_info,
@@ -178,11 +156,6 @@ class MCPClient:
         *,
         progress_token: Optional[str] = None,
     ) -> Any:
-        """
-        Invoke a tool by name.
-        Returns the raw result content list.
-        Raises MCPError on tool-reported errors.
-        """
         params: Dict[str, Any] = {"name": name, "arguments": arguments}
         if progress_token:
             params["_meta"] = {"progressToken": progress_token}
@@ -282,10 +255,6 @@ class MCPClient:
         return resp.get("result", {})
 
     def set_log_level(self, level: str) -> None:
-        """
-        Set server log level.
-        level: 'debug' | 'info' | 'notice' | 'warning' | 'error' | 'critical' | 'alert' | 'emergency'
-        """
         cap = self.server_capabilities.get("logging", {})
         if not cap and "logging" not in self.server_capabilities:
             return  
@@ -307,31 +276,9 @@ class MCPClient:
         self._notify("notifications/cancelled", params)
 
     def set_sampling_handler(self, handler: Callable[[Dict[str, Any]], Dict[str, Any]]) -> None:
-        """
-        Register a handler for sampling/createMessage requests from the server.
-
-        The handler receives the full params dict and must return a result dict::
-
-            def my_handler(params):
-
-                return {
-                    "role": "assistant",
-                    "content": {"type": "text", "text": "..."},
-                    "model": "claude-3-5-sonnet",
-                    "stopReason": "endTurn",
-                }
-        """
         self._sampling_handler = handler
 
     def set_roots_handler(self, handler: Callable[[], List[Dict[str, Any]]]) -> None:
-        """
-        Register a handler for roots/list requests from the server.
-
-        The handler must return a list of root dicts::
-
-            def my_roots():
-                return [{"uri": "file:///project", "name": "My Project"}]
-        """
         self._roots_list_handler = handler
 
     def set_roots(self, roots: List[Dict[str, Any]]) -> None:
