@@ -1,6 +1,3 @@
-
----
-
 # Yay - an autonomous CLI Coding Agent 
 
 ## Installation
