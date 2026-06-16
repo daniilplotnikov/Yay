@@ -12,6 +12,3 @@ dependencies = [
     "textual",
     "websocket"
 ]
-
-[project.scripts]
-yay = "yay.cli:main"
