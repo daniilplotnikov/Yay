@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import inspect
+import asyncio
+
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
+
 from .events import EventBus, ContextCompressionNeededEvent
+
 SYSTEM_SUMMARY_MARKER = "[COMPRESSED_CONTEXT]"
+
 
 class Content:
     def __init__(self, text: str = "") -> None:
@@ -12,6 +18,7 @@ class Content:
     def __repr__(self) -> str:
         preview = self.text[:60].replace("\n", "\\n")
         return f"Content({preview!r}{'…' if len(self.text) > 60 else ''})"
+
 
 class Message:
     def __init__(
@@ -33,6 +40,7 @@ class Message:
     def __repr__(self) -> str:
         return f"Message(role={self.role!r}, tool={bool(self.tool)})"
 
+
 class Context:
     def __init__(
         self,
@@ -40,7 +48,7 @@ class Context:
         compress_threshold: float = 0.8,
         compression_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         system_prompt: Optional[str] = None,
-        bus: EventBus = None
+        bus: Optional[EventBus] = None,
     ) -> None:
         self.provider = provider
         self.messages: List[Message] = []
@@ -70,7 +78,9 @@ class Context:
             self.messages.append(message)
 
         if self.bus and self.needs_compression():
-            self.bus.emit(ContextCompressionNeededEvent())
+            asyncio.create_task(
+                self.bus.emit(ContextCompressionNeededEvent())
+            )
 
     def _insert_summary(self, summary_msg: Message) -> None:
         self.messages = [
@@ -80,7 +90,6 @@ class Context:
                 and getattr(m.content, "text", "").startswith(SYSTEM_SUMMARY_MARKER)
             )
         ]
-
         insert_at = 1 if (self.messages and self.messages[0].role == "system") else 0
         self.messages.insert(insert_at, summary_msg)
 
@@ -113,10 +122,9 @@ class Context:
     def needs_compression(self) -> bool:
         return self.usage_percent() >= self.compress_threshold * 100
 
-    def compress(self) -> bool:
+    async def compress(self) -> bool:
 
         non_system = [m for m in self.messages if m.role != "system"]
-
         if len(non_system) <= 10:
             return False
 
@@ -125,7 +133,11 @@ class Context:
 
         before_tokens = self.estimate_tokens()
 
-        summary_text = self.provider.summarize(to_summarise)
+        if inspect.iscoroutinefunction(self.provider.summarize):
+            summary_text = await self.provider.summarize(to_summarise)
+        else:
+            import asyncio as _asyncio
+            summary_text = await _asyncio.to_thread(self.provider.summarize, to_summarise)
 
         new_messages: List[Message] = []
 
@@ -147,12 +159,14 @@ class Context:
         after_tokens = self.estimate_tokens()
 
         if self.compression_callback:
-            self.compression_callback(
-                {
-                    "before_tokens": before_tokens,
-                    "after_tokens": after_tokens,
-                    "usage_percent": self.usage_percent(),
-                }
-            )
+            info = {
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
+                "usage_percent": self.usage_percent(),
+            }
+            if inspect.iscoroutinefunction(self.compression_callback):
+                await self.compression_callback(info)
+            else:
+                self.compression_callback(info)
 
         return True

@@ -1,331 +1,225 @@
 from __future__ import annotations
 
+import asyncio
 import json
-import threading
-from queue import Queue
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Optional
 
 from .llm import Content, Context, Message
-from .managers import ToolsManager
-from .provider import Provider
-from .steering import SteeringState
+from .events import *
 from .task import Task
-from .events import EventBus, TaskStartedEvent, ModelProcessingEvent, ApprovalRequestedEvent, \
-    StreamChunkEvent, ProviderResponseEvent, TaskFinishedEvent, TaskErrorEvent, ToolCallEvent, \
-    ToolFinishedEvent, ContextCompressedEvent, ContextCompressionErrorEvent, ApprovalGrantedEvent,\
-    ApprovalDeniedEvent, AgentPausedEvent, AgentResumedEvent, ToolStartedEvent, ToolErrorEvent,\
-    QuestionRequestedEvent, ContextCompressionNeededEvent
+from .provider import Provider
+from .managers import ToolsManager
+from .steering import SteeringState
+from .tools import ToolExecutor
 
-ApproveMode = Literal["never", "safe", "always"]
+ApproveMode = str
+
+class SuspensionReason:
+    APPROVAL = "approval"
+    QUESTION = "question"
+
+class Suspension:
+    def __init__(self):
+        self.reason: Optional[str] = None
+        self.input: Any = None
+        self.output: Any = None
 
 class Agent:
     def __init__(
         self,
-        bus: EventBus,
+        bus,
         provider: Provider,
         context: Context,
         tools_manager: ToolsManager,
-        approve_mode: ApproveMode = "never"
-    ) -> None:
-
+        tool_executor: ToolExecutor,
+        approve_mode: ApproveMode = "never",
+    ):
         self.bus = bus
-
         self.provider = provider
         self.context = context
-        self.context.compression_callback = self._on_context_compressed
+        self.tools_manager = tools_manager
+        self.tool_executor = tool_executor
+        self.approve_mode = approve_mode
 
         self.steering = SteeringState()
-        self.approve_mode: ApproveMode = approve_mode
-        self.tools_manager = tools_manager
 
-        self._approval_event = threading.Event()
-        self._approval_result: Optional[bool] = None
+        self.context.compression_callback = self._on_context_compressed
 
-        self._question_event = threading.Event()
-        self._question_answer: Optional[str] = None
+        self.task_queue: asyncio.Queue[Task] = asyncio.Queue()
 
-        self._pause_event = threading.Event()
-        self._pause_event.set()  
-
-        self.task_queue: Queue[Task] = Queue()
-        self.worker_thread: Optional[threading.Thread] = None
         self.running = False
+        self.worker_task: Optional[asyncio.Task] = None
         self.current_task: Optional[Task] = None
 
-        self.bus.subscribe(ApprovalGrantedEvent)(self._on_approval_granted)
-        self.bus.subscribe(ApprovalDeniedEvent)(self._on_approval_denied)
-        self.bus.subscribe(QuestionRequestedEvent)(self._on_question_requested)
-        self.bus.subscribe(ContextCompressionNeededEvent)(self._on_compression_needed)
+        self.suspension: Optional[Suspension] = None
+        self._resume_event = asyncio.Event()
 
-    def pause(self) -> None:
-        self.bus.emit(AgentPausedEvent())
-        self._pause_event.clear()
-
-    def resume(self) -> None:
-        self.bus.emit(AgentResumedEvent())
-        self._pause_event.set()
-
-    @property
-    def is_paused(self) -> bool:
-        return not self._pause_event.is_set()
-
-    def wait_if_paused(self) -> None:
-        self._pause_event.wait()
-
-    @property
-    def tools(self) -> Dict[str, Any]:
-        return self.tools_manager.get_tools()
-
-    def replace_tools(self, tools) -> None:
-        self.tools_manager.unregister_many(list(self.tools_manager.get_tools().keys()))
-        self.tools_manager.register_many(tools)
-
-    def run_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
-        tool = self.tools.get(tool_name)
-        if tool is None:
-            raise ValueError(f"Unknown tool: {tool_name!r}")
-        runner = getattr(tool, "run", None)
-        if runner is None or not callable(runner):
-            runner = tool if callable(tool) else None
-        if runner is None:
-            raise ValueError(f"Tool {tool_name!r} has no callable 'run' method")
-        return runner(args)
-
-    def needs_approval(self, tool_name: str) -> bool:
-        if self.approve_mode == "always":
-            return False
-        if self.approve_mode == "never":
-            return True
-        tool = self.tools.get(tool_name)
-        if tool is None:
-            return True 
-        return not getattr(tool, "is_safe", False)
-
-    def request_approval(self, tool_name: str, args: Dict[str, Any]) -> bool:
-        self._approval_event.clear()
-        self._approval_result = None
-
-        self.bus.emit(ApprovalRequestedEvent(tool=tool_name, args=args))
-
-        self._approval_event.wait()
-        return bool(self._approval_result)
-
-    def resolve_approval(self, value: bool) -> None:
-        self._approval_result = value
-        self._approval_event.set()
-
-    def _on_approval_granted(self, e: ApprovalGrantedEvent) -> None:
-        self.resolve_approval(True)
-
-    def _on_approval_denied(self, e: ApprovalDeniedEvent) -> None:
-        self.resolve_approval(False)
-
-    def resolve_question(self, answer: str) -> None:
-        self._question_answer = answer
-        self._question_event.set()
-
-    def _on_question_requested(self, e: QuestionRequestedEvent) -> None:
-        self._question_event.clear()
-        self._question_answer = None
-
-    def add_instruction(self, text: str) -> None:
-        self.steering.instructions.append(text)
-
-    def clear_instructions(self) -> None:
-        self.steering.instructions.clear()
-
-    def _build_steering_prompt(self) -> Optional[str]:
-        if not self.steering.instructions:
-            return None
-        return "\n".join(self.steering.instructions)
-
-    def _extract_tool_call(self, response: Message) -> Optional[Dict[str, Any]]:
+    def _extract_tool_calls(self, response: Message) -> list[dict]:
         tool = getattr(response, "tool", None)
         if not tool:
-            return None
+            return []
+
+        result = []
 
         if isinstance(tool, dict):
             calls = tool.get("calls")
+
             if calls:
-                call = calls[0]
-                return {
-                    "id":   call.get("id"),
-                    "name": call.get("name"),
-                    "args": call.get("arguments", {}),
-                }
-            if "name" in tool:
-                return {
-                    "id":   None,
+                for c in calls:
+                    result.append({
+                        "id": c.get("id"),
+                        "name": c.get("name"),
+                        "args": c.get("arguments", {}) or {},
+                    })
+
+            elif "name" in tool:
+                result.append({
+                    "id": tool.get("id"),
                     "name": tool.get("name"),
-                    "args": tool.get("arguments", {}),
-                }
+                    "args": tool.get("arguments", {}) or {},
+                })
 
-        return None
+        return result
+    
+    async def _suspend(self, reason: str, payload: Any = None):
+        self.suspension = Suspension()
+        self.suspension.reason = reason
+        self.suspension.input = payload
 
-    def work_loop(self, prompt: str) -> Any:
-        self.bus.emit(TaskStartedEvent(prompt=prompt))
+        self._resume_event.clear()
+        await self._resume_event.wait()
 
-        steering_text = self._build_steering_prompt()
-        full_prompt = f"{steering_text}\n\n{prompt}" if steering_text else prompt
+        result = self.suspension.output
+        self.suspension = None
+        return result
+
+    def resume_with_approval(self, value: bool):
+        if self.suspension and self.suspension.reason == SuspensionReason.APPROVAL:
+            self.suspension.output = value
+            self._resume_event.set()
+
+    def resume_with_answer(self, answer: str):
+        if self.suspension and self.suspension.reason == SuspensionReason.QUESTION:
+            self.suspension.output = answer
+            self._resume_event.set()
+
+    async def work_loop(self, prompt: str):
+        await self.bus.emit(TaskStartedEvent(prompt=prompt))
 
         self.context.append(
-            Message(role="user", content=Content(text=full_prompt))
+            Message(role="user", content=Content(text=prompt))
         )
 
         while True:
-            self.wait_if_paused()
-            self.bus.emit(ModelProcessingEvent())
+            await self.bus.emit(ModelProcessingEvent())
 
-            response = self.provider.process_stream(
+            response = await self.provider.process_stream(
                 self.context,
-                on_chunk=lambda data: self.bus.emit(StreamChunkEvent(data=data)),
+                on_chunk=lambda c: asyncio.create_task(
+                    self.bus.emit(StreamChunkEvent(data=c))
+                ),
             )
 
             self.context.append(response)
-            self.bus.emit(ProviderResponseEvent(message=response))
 
-            tool_call = self._extract_tool_call(response)
+            await self.bus.emit(
+                ProviderResponseEvent(message=response)
+            )
 
-            if tool_call is None:
-                text = getattr(getattr(response, "content", None), "text", "") or ""
-                text = text.strip()
+            tool_calls = self._extract_tool_calls(response)
+
+            if not tool_calls:
+                text = (
+                    getattr(getattr(response, "content", None), "text", "")
+                    or ""
+                ).strip()
+
                 if not text:
-                    raise RuntimeError(
-                        "Model returned an empty response (no tool call, no text). "
-                        f"Raw content: {getattr(response.content, 'text', None)!r}"
-                    )
-                self.bus.emit(TaskFinishedEvent(result=text))
+                    raise RuntimeError("Empty model response")
+
+                await self.bus.emit(TaskFinishedEvent(result=text))
                 return text
 
-            tool_name    = tool_call.get("name")
-            args         = tool_call.get("args", {})
-            tool_call_id = tool_call.get("id")
+            for call in tool_calls:
+                tool_name = call["name"]
+                args = call["args"]
+                tool_id = call.get("id")
 
-            self.bus.emit(ToolCallEvent(tool=tool_name, args=args))
+                await self.bus.emit(
+                    ToolCallEvent(tool=tool_name, args=args)
+                )
 
-            if self.needs_approval(tool_name):
-                approved = self.request_approval(tool_name, args)
-                if not approved:
-                    self.bus.emit(ApprovalDeniedEvent(tool=tool_name))
-                    self.context.append(
-                        Message(
-                            role="tool",
-                            tool=tool_name,
-                            tool_call_id=tool_call_id,
-                            content=Content(text="Tool execution denied by user"),
+                if self.approve_mode != "always":
+                    approved = await self._suspend(
+                        SuspensionReason.APPROVAL,
+                        (tool_name, args),
+                    )
+
+                    if not approved:
+                        await self.bus.emit(
+                            ApprovalDeniedEvent(tool=tool_name)
                         )
+                        continue
+
+                result = await self.tool_executor.run_tool(
+                    tool_name,
+                    args,
+                )
+
+                if tool_name in {"Question", "QuestionTool"} and isinstance(result, dict) and result.get("waiting_for_user"):
+                    await self.bus.emit(QuestionRequestedEvent(payload=result))
+
+                    answer = await self._suspend(
+                        SuspensionReason.QUESTION,
+                        result,
+                    )
+
+                    self.context.append(
+                        Message(role="user", content=Content(text=answer))
                     )
                     continue
-                self.bus.emit(ApprovalGrantedEvent(tool=tool_name))
-
-            self.bus.emit(ToolStartedEvent(tool=tool_name))
-            self.wait_if_paused()
-
-            try:
-                result = self.run_tool(tool_name, args)
-            except Exception as e:
-                result = {"error": str(e)}
-                self.bus.emit(ToolErrorEvent(tool=tool_name, error=e))
-                self.context.append(
-                    Message(
-                        role="tool",
-                        tool=tool_name,
-                        tool_call_id=tool_call_id,
-                        content=Content(text=json.dumps(result, ensure_ascii=False)),
-                    )
-                )
-                continue
-
-            if (
-                tool_name in {"Question", "QuestionTool"}
-                and isinstance(result, dict)
-                and result.get("waiting_for_user")
-            ):
-                self._question_event.clear()
-                self._question_answer = None
-                self.bus.emit(QuestionRequestedEvent(payload=result))
-
-                self._question_event.wait()
-                answer = self._question_answer or ""
 
                 self.context.append(
                     Message(
                         role="tool",
                         tool=tool_name,
-                        tool_call_id=tool_call_id,
-                        content=Content(text=json.dumps(result, ensure_ascii=False)),
-                    )
-                )
-                self.context.append(
-                    Message(role="user", content=Content(text=answer))
-                )
-                continue
-
-            if tool_name in {"FinishTask", "FinishTaskTool"}:
-                self.bus.emit(ToolFinishedEvent(tool=tool_name, result=result))
-                self.context.append(
-                    Message(
-                        role="tool",
-                        tool=tool_name,
-                        tool_call_id=tool_call_id,
+                        tool_call_id=tool_id,
                         content=Content(
-                            text=result if isinstance(result, str)
-                            else json.dumps(result, ensure_ascii=False)
+                            text=self.tool_executor.normalize_result(result)
                         ),
                     )
                 )
-                self.bus.emit(TaskFinishedEvent(result=result))
-                return result
 
-            self.bus.emit(ToolFinishedEvent(tool=tool_name, result=result))
-            self.context.append(
-                Message(
-                    role="tool",
-                    tool=tool_name,
-                    tool_call_id=tool_call_id,
-                    content=Content(
-                        text=result if isinstance(result, str)
-                        else json.dumps(result, ensure_ascii=False)
-                    ),
-                )
-            )
+    async def enqueue(self, prompt: str, task_id: str, metadata=None):
+        await self.task_queue.put(Task(prompt=prompt, task_id=task_id, metadata=metadata))
 
-    def _queue_loop(self) -> None:
+    async def _queue_loop(self):
         while self.running:
-            try:
-                task = self.task_queue.get(timeout=1.0)
-            except Exception:
-                continue
-
+            task = await self.task_queue.get()
             self.current_task = task
+
             try:
-                self.work_loop(task.prompt)
+                await self.work_loop(task.prompt)
             except Exception as e:
-                self.bus.emit(TaskErrorEvent(task_id=task.task_id, error=e))
+                await self.bus.emit(TaskErrorEvent(task_id=task.task_id, error=e))
             finally:
                 self.current_task = None
                 self.task_queue.task_done()
 
-    def enqueue(self, prompt: str, task_id: str, metadata: Any = None) -> None:
-        self.task_queue.put(Task(prompt=prompt, task_id=task_id, metadata=metadata))
-
-    def start_queue(self) -> None:
+    async def start_queue(self):
         if self.running:
             return
         self.running = True
-        self.worker_thread = threading.Thread(
-            target=self._queue_loop, daemon=True, name="agent-worker"
-        )
-        self.worker_thread.start()
+        self.worker_task = asyncio.create_task(self._queue_loop())
 
-    def stop_queue(self) -> None:
+    async def stop_queue(self):
         self.running = False
+        if self.worker_task:
+            self.worker_task.cancel()
 
-    def _on_context_compressed(self, info: Dict[str, Any]) -> None:
-        self.bus.emit(ContextCompressedEvent(info=info))
+    async def _on_context_compressed(self, info):
+        await self.bus.emit(ContextCompressedEvent(info=info))
 
-    def _on_compression_needed(self, e: ContextCompressionNeededEvent) -> None:
-        try:
-            self.context.compress()
-        except Exception as ex:
-            self.bus.emit(ContextCompressionErrorEvent(error=ex))
+    @property
+    def is_paused(self) -> bool:
+        return self.suspension is not None

@@ -1,1 +1,2 @@
 from .openai_compatible import OpenAICompatibleProvider
+from .openrouter import OpenRouter
