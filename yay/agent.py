@@ -62,13 +62,17 @@ class Agent:
         self.workflow = workflow or create_default_workflow()
         self.runner = WorkflowRunner(self.workflow)
 
-    async def _suspend(self, reason: str, payload: Any = None):
+    async def _suspend(self, reason: str, payload: Any = None, timeout: float | None = None):
         self.suspension = Suspension()
         self.suspension.reason = reason
         self.suspension.input = payload
 
         self._resume_event.clear()
-        await self._resume_event.wait()
+        try:
+            await asyncio.wait_for(self._resume_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.suspension = None
+            raise TimeoutError(f"Suspension timed out waiting for resume (reason={reason})")
 
         result = self.suspension.output
         self.suspension = None
@@ -127,6 +131,10 @@ class Agent:
         self.running = False
         if self.worker_task:
             self.worker_task.cancel()
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                pass
 
     async def _on_context_compressed(self, info):
         await self.bus.emit(ContextCompressedEvent(info=info))

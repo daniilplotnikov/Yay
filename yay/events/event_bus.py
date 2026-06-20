@@ -34,13 +34,34 @@ class EventBus:
         if not handlers:
             return
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self._run_handler(handler, event)
                 for handler in handlers
             ],
             return_exceptions=True
         )
+
+        for result in results:
+            if isinstance(result, Exception):
+                # Avoid infinite recursion if the error event itself fails
+                if isinstance(event, ErrorEvent):
+                    continue
+                tb = getattr(result, "__traceback__", None)
+                error_event = ErrorEvent(
+                    source="EventBus",
+                    message=f"Handler error for {type(event).__name__}: {result}",
+                    traceback=traceback.format_exception(type(result), result, tb) if tb else None,
+                )
+                # Fire-and-forget: don't await to avoid blocking
+                asyncio.create_task(self._safe_emit(error_event))
+
+    async def _safe_emit(self, event: Event) -> None:
+        """Emit without raising — used for error reporting to avoid infinite loops."""
+        try:
+            await self.emit(event)
+        except Exception:
+            pass
 
     async def _run_handler(self, handler: Callable, event: Event) -> None:
         try:

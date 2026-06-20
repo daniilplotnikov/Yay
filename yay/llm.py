@@ -56,6 +56,7 @@ class Context:
         self.compression_callback = compression_callback
         self._system_prompt: Optional[str] = None
         self.bus = bus
+        self._compression_tasks: set[asyncio.Task] = set()
 
         if system_prompt:
             self.set_system_prompt(system_prompt)
@@ -78,9 +79,12 @@ class Context:
             self.messages.append(message)
 
         if self.bus and self.needs_compression():
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self.bus.emit(ContextCompressionNeededEvent())
             )
+            # Prevent the task from being garbage-collected before completion
+            self._compression_tasks.add(task)
+            task.add_done_callback(self._compression_tasks.discard)
 
     def _insert_summary(self, summary_msg: Message) -> None:
         self.messages = [

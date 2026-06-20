@@ -1,6 +1,6 @@
 from .events import EventBus
 from .llm import Context
-from .tools import ToolsManager
+from .tools import ToolsManager, ToolExecutor
 from .provider import Provider
 from .sysprompt import SystemPromptBuilder
 
@@ -28,7 +28,7 @@ async def build_agent(
             pass
     else:
         try:
-            models = provider.get_models()
+            models = await provider.get_models()
             if models:
                 provider.model = models[0]
         except Exception:
@@ -40,6 +40,8 @@ async def build_agent(
         except Exception:
             pass
 
+    tool_executor = ToolExecutor(tools_manager=tools_manager, bus=bus)
+
     agent = Agent(
         bus=bus,
         provider=provider,
@@ -49,6 +51,7 @@ async def build_agent(
             bus=bus,
         ),
         tools_manager=tools_manager,
+        tool_executor=tool_executor,
         approve_mode=approve_mode,
     )
 

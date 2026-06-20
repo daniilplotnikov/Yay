@@ -46,12 +46,6 @@ class DefaultAgentStep(Step):
                         "Empty model response"
                     )
 
-                await agent.bus.emit(
-                    TaskFinishedEvent(
-                        result=text
-                    )
-                )
-
                 return Finish(text)
 
             for call in tool_calls:

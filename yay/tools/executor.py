@@ -59,7 +59,7 @@ class ToolExecutor:
                     error=e,
                 )
             )
-            return {"error": str(e)}
+            raise
 
     def normalize_result(self, result: Any) -> str:
         if isinstance(result, str):

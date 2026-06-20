@@ -46,26 +46,3 @@ class Workflow:
         return self
 
 
-class WorkflowRunner:
-    def __init__(self, workflow: Workflow):
-        self.workflow = workflow
-
-    async def run(self, agent):
-        ctx = WorkflowContext()
-
-        current = self.workflow.start_node
-
-        while current:
-            step = self.workflow.nodes[current]
-
-            result = await step.run(agent, ctx)
-
-            if isinstance(result, Finish):
-                return result.result
-
-            if isinstance(result, Transition):
-                current = result.target
-            else:
-                current = self.workflow.edges.get(current)
-
-        return ctx.result
