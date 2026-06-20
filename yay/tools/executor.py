@@ -5,7 +5,7 @@ import inspect
 import json
 from typing import Any, Dict
 
-from ..managers import ToolsManager
+from .tools_manager import ToolsManager
 from ..events import EventBus, ToolStartedEvent, ToolFinishedEvent, ToolErrorEvent
 
 

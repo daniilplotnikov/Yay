@@ -7,7 +7,7 @@ from openai import OpenAI
 
 from ..llm import Message, Content
 from ..provider import Provider
-from ..managers import ToolsManager
+from ..tools import ToolsManager
 from ..events import EventBus, ErrorEvent
 
 

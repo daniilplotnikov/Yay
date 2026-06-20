@@ -8,9 +8,8 @@ from .llm import Content, Context, Message
 from .events import *
 from .task import Task
 from .provider import Provider
-from .managers import ToolsManager
 from .steering import SteeringState
-from .tools import ToolExecutor
+from .tools import ToolExecutor, ToolsManager
 
 ApproveMode = str
 

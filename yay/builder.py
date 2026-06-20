@@ -1,16 +1,18 @@
 from .events import EventBus
 from .llm import Context
-from .managers import ToolsManager
+from .tools import ToolsManager
 from .provider import Provider
 from .sysprompt import SystemPromptBuilder
 
 
 async def build_agent(
     *,
-    cfg: dict,
     bus: EventBus,
     tools_manager: ToolsManager,
     provider: Provider,
+    model: str | None = None,
+    context_length: int | None = None,
+    approve_mode: str = "safe",
     workspace_loader=None,
     mcp_manager=None,
 ):
@@ -19,10 +21,9 @@ async def build_agent(
     if mcp_manager is not None:
         await mcp_manager.fetch_all()
 
-    configured_model = cfg.get("model", "")
-    if configured_model:
+    if model:
         try:
-            provider.model = configured_model
+            provider.model = model
         except Exception:
             pass
     else:
@@ -33,10 +34,9 @@ async def build_agent(
         except Exception:
             pass
 
-    ctx_length = cfg.get("context_length")
-    if ctx_length:
+    if context_length is not None:
         try:
-            provider.context_length = int(ctx_length)
+            provider.context_length = context_length
         except Exception:
             pass
 
@@ -49,7 +49,7 @@ async def build_agent(
             bus=bus,
         ),
         tools_manager=tools_manager,
-        approve_mode=cfg.get("approve_mode", "safe"),
+        approve_mode=approve_mode,
     )
 
     if workspace_loader is not None:
