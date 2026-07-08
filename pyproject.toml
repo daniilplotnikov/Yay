@@ -2,13 +2,5 @@
 name = "yay-agent"
 version = "0.1.0"
 dependencies = [
-    "openai",
-    "rich",
-    "typer",
-    "prompt_toolkit",
-    "requests",
-    "pypdf",
-    "bs4",
-    "textual",
-    "websocket"
+    "openai"
 ]
