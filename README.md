@@ -1,1 +1,1 @@
-# Yay - an agent core
+# Yay - is a simple agent framework
