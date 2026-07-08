@@ -1,1 +1,1 @@
-# Yay - is a simple agent framework
+# Yay - is a minimalistic agent framework
